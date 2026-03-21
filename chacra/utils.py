@@ -1,20 +1,16 @@
 import re
 import json
+import os
+import warnings
+
 import pandas as pd
 import psutil
 
-from pdbfixer import PDBFixer
-from openmm.app import PDBFile, Modeller, ForceField, Simulation
-from openmm import LangevinMiddleIntegrator, MonteCarloBarostat, XmlSerializer
-from openmm.unit import nanometer, bar, picosecond, femtoseconds, molar, atomic_mass_unit
-from openmm.app import PME, HBonds
-import os
-import warnings
 warnings.filterwarnings(
     "ignore",
     message="pkg_resources is deprecated as an API.*",
     category=UserWarning,
-)#pdbfixer
+)  # pdbfixer
 
 
 def make_contact_frequency_dictionary(freq_files: list) -> pd.DataFrame:
@@ -173,6 +169,9 @@ def fix_pdb(input_pdb, output_pdb, pH=7.0, keep_water=False, replace_nonstandard
     PDBFixer convenience function 
     
     '''
+    from pdbfixer import PDBFixer
+    from openmm.app import PDBFile
+
     # https://htmlpreview.github.io/?https://github.com/openmm/pdbfixer/blob/master/Manual.html
     fixer = PDBFixer(filename=input_pdb)
     fixer.findMissingResidues()
@@ -207,6 +206,10 @@ class OMMSetup:
                  Hmass=2.0,
                  timestep=2,
                  ):
+        from openmm.app import PDBFile, Modeller, ForceField, Simulation, PME, HBonds
+        from openmm import LangevinMiddleIntegrator, MonteCarloBarostat, XmlSerializer
+        from openmm.unit import nanometer, bar, picosecond, femtoseconds, molar, atomic_mass_unit
+
         self.structures = structures
         self.nonbonded_cutoff = nonbonded_cutoff*nanometer
         self.integrator_type = LangevinMiddleIntegrator
@@ -288,68 +291,124 @@ class OMMSetup:
         with open(f'{output}/structures/{self.name}_minimized.pdb', 'w') as f:
             PDBFile.writeFile(topology, positions, f)
 
-class RunConfig():
-    '''
-    NOT IMPLEMENTED YET
-    Class to hold configuration for running simulations.
-    On the first remd run, a json parameter file will be created in the 
-    project root directory. On subusequent runs, you can just provide the 
-    parameter file and change the number of cycles with the command line 
-    argument if desired.
+class RunConfig:
+    """
+    Configuration manager for ChACRA HREMD runs.
 
-    '''
-    def __init__(self,
-                 configFile=None
-                 ):
-        self.configFile = configFile
-        self.defaults = {
-        "n_jobs":None,
-        "n_cycles":1000,
-        "n_systems":None,
-        "min_temp":290,
-        "max_temp":450,
-        "structure_file":None,
-        "system_file":None,
-        "steps_per_cycle":1000,
-        "save_interval":10,
-        "checkpoint_interval":1000,
-        "warmup_steps":100_000,
-        "lambda_selection":'protein',
-        "output_selection":'protein',
-        "timestep":2,
-        }
-        if self.configFile is None:
-            print("No config file provided.")
-        
-        else:
-            if os.path.exists(self.configFile):
-                fileType = self.configFile.split(".")[-1]
-                if fileType == "json":
-                    
-                    with open(self.configFile, 'r') as f:
-                        self.config = json.load(f)
-                else: # option for simple key=value text file
-                    try:
-                        with open(self.configFile, 'r') as f:
-                            lines = f.readlines()
-                            self.config = {}
-                            for line in lines:
-                                if "=" in line:
-                                    key, value = line.split("=")
-                                    key = key.strip()
-                                    value = value.strip()
-                                    if key in ["min_temp", "max_temp", 
-                                               "timestep"]:
-                                        value = float(value)
-                                    elif value.isdigit():
-                                        value = int(value)
-                    
-                                    self.config[key] = value
-                
-                    except:
-                        print("Could not read config file.")
-                
-                for key, val in self.config:
-                    if val == "None":
-                        print(f"{key} not specified")
-                        return
+    Reads and writes ``chacra_run.json`` in the project root directory.
+    On the first run this file is created with all resolved parameters
+    (including the full temperature list).  On subsequent runs it is loaded
+    automatically so the user does not need to re-supply every CLI flag.
+    CLI arguments always take precedence over values stored in the JSON.
+
+    Parameters
+    ----------
+    config_file : str or None
+        Path to an existing ``chacra_run.json``.  If *None* an empty config
+        is created using built-in defaults.
+
+    Attributes
+    ----------
+    defaults : dict
+        Hard-coded default values for every parameter.
+    config : dict
+        The resolved configuration.  Starts from ``defaults`` and is
+        overridden by any values loaded from *config_file*.
+    """
+
+    #: Default path written/read in the project root directory.
+    DEFAULT_PATH: str = "chacra_run.json"
+
+    defaults: dict = {
+        "n_jobs": None,
+        "n_cycles": 1000,
+        "n_systems": None,
+        "min_temp": 290.0,
+        "max_temp": 450.0,
+        "temps": None,          # populated after first run
+        "structure_file": None,
+        "system_file": None,
+        "steps_per_cycle": 1000,
+        "save_interval": 10,
+        "checkpoint_interval": 500,
+        "warmup_steps": 0,
+        "lambda_selection": "protein",
+        "output_selection": "protein",
+        "timestep": 2,
+        "current_run": 0,
+    }
+
+    def __init__(self, config_file: str | None = None):
+        self.config_file = config_file
+        # Start from defaults, then overlay file contents
+        self.config: dict = dict(self.defaults)
+
+        if config_file is not None:
+            if os.path.exists(config_file):
+                self._load(config_file)
+            else:
+                print(f"[RunConfig] Config file not found: {config_file}")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def write(self, path: str | None = None) -> None:
+        """
+        Serialise ``self.config`` to JSON.
+
+        Parameters
+        ----------
+        path : str or None
+            Destination path.  Defaults to :attr:`DEFAULT_PATH`
+            (``chacra_run.json`` in the current working directory).
+        """
+        dest = path or self.DEFAULT_PATH
+        with open(dest, "w") as fh:
+            json.dump(self.config, fh, indent=2)
+        print(f"[RunConfig] Config written to {dest}")
+
+    def update(self, **kwargs) -> None:
+        """
+        Update individual config keys, ignoring keys whose value is *None*
+        (so CLI arg defaults don't silently erase stored values).
+
+        Parameters
+        ----------
+        **kwargs
+            Key-value pairs to merge into ``self.config``.
+        """
+        for key, value in kwargs.items():
+            if value is not None:
+                self.config[key] = value
+
+    def apply_to_namespace(self, namespace) -> None:
+        """
+        Back-fill an ``argparse.Namespace`` with config values for any
+        attribute that is currently *None*.  This lets CLI-supplied arguments
+        always win while filling gaps from the JSON.
+
+        Parameters
+        ----------
+        namespace : argparse.Namespace
+        """
+        for key, value in self.config.items():
+            if getattr(namespace, key, None) is None and value is not None:
+                setattr(namespace, key, value)
+
+    def get(self, key: str, default=None):
+        """Return a config value, falling back to *default*."""
+        return self.config.get(key, default)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _load(self, path: str) -> None:
+        """Load JSON from *path* and overlay onto ``self.config``."""
+        try:
+            with open(path, "r") as fh:
+                data = json.load(fh)
+            self.config.update(data)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[RunConfig] Could not read config file '{path}': {exc}")

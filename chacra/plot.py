@@ -79,8 +79,9 @@ def plot_chacras(
         The ContactPCA object.
     n_pcs : int
         The number of PCs to include in the plot.
-    contacts : ContactFrequencies (remove)
-        provide the contact frequencies object to get the temps from the index.
+    contacts : ContactFrequencies
+        Contact frequencies object; used to read temperatures from its index
+        if the ``temps`` argument is not supplied.
     temps : list
         List of temperatures.
     colors : list
@@ -300,7 +301,7 @@ fig.tight_layout()
 
 def plot_energies(energies:np.ndarray, filename:str|os.PathLike|None=None, 
                   n_bins:int=20):
-    """'
+    """
     energies : np.array
         The n_cycles x n_states array of energies from the replica exchange
         simulations.

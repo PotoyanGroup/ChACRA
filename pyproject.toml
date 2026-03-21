@@ -17,8 +17,25 @@ authors = [{name = "Dan Burns", email = "dnlburns808@gmail.com"}]
 license = {file = "LICENSE"}
 readme = "README.md"
 dependencies = [
-        
-            ]
+    "MDAnalysis>=2.9.0",
+    "pandas",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "tqdm",
+    "matplotlib",
+    "networkx",
+    "pyarrow",
+    "joblib",
+    "psutil",
+    "biopython",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-cov",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]  

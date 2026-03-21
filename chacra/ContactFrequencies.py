@@ -170,15 +170,18 @@ class ContactFrequencies:
                 if file_extension == ".csv":
                     self.freqs = pd.read_csv(contact_data, index_col=0)
 
-                elif file_extension == ".pd":
+                elif file_extension in (".pd", ".pkl", ".pickle"):
                     self.freqs = pd.read_pickle(contact_data)
-                else:
 
-                    print(
-                        "Provide a file with a .csv or .pd (pickle format) "
-                        "file extension.\n"
-                        "Or provide a path the folder containing the "
-                        "original getcontacts .tsv files."
+                elif file_extension == ".parquet":
+                    self.freqs = pd.read_parquet(contact_data)
+
+                else:
+                    raise ValueError(
+                        f"Unsupported file extension '{file_extension}'. "
+                        "Provide a .csv, .parquet, or .pd (pickle) file, "
+                        "or a path to the folder containing the original "
+                        "getcontacts .tsv files."
                     )
 
             elif os.path.isdir(contact_data):
@@ -199,17 +202,18 @@ class ContactFrequencies:
                     contact_files
                 )
                 self.freqs = pd.DataFrame(contact_dictionary)
-        except:
+        except (TypeError, AttributeError):
             try:
-                if type(contact_data) == pd.DataFrame:
+                if isinstance(contact_data, pd.DataFrame):
                     self.freqs = contact_data
-                elif type(contact_data) == dict:
+                elif isinstance(contact_data, dict):
                     self.freqs = pd.DataFrame(contact_data)
-            except:
-                (
-                    "Provide one of file (.pd or .csv extension), pd.DataFrame, "
-                    "dict, or path to original getcontacts .tsv frequency files.\n"
-                )
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "Provide one of: file path (.parquet, .csv, or .pd extension), "
+                    "pd.DataFrame, dict, or path to a directory containing "
+                    "getcontacts .tsv frequency files."
+                ) from exc
 
         if temps is not None:
             mapper = {key: temp for key, temp in zip(self.freqs.index, temps)}
@@ -273,14 +277,14 @@ class ContactFrequencies:
         """
 
         if resid2 is not None:
-            if type(resid2) == tuple:
+            if isinstance(resid2, tuple):
                 chain2 = resid2[0]
                 resn2 = resid2[1]
                 resid2 = resid2[2]
             else:
                 chain2 = "[A-Z1-9]+"
                 resn2 = "[A-Z]+"
-            if type(resid1) == tuple:
+            if isinstance(resid1, tuple):
                 chain = resid1[0]
                 resn = resid1[1]
                 resid1 = resid1[2]
@@ -291,7 +295,7 @@ class ContactFrequencies:
             regex2 = rf"{chain2}:{resn2}:{resid2}(?!\d)-{chain}:{resn}:{resid1}(?!\d)"
             regex = rf"{regex1}|{regex2}"
         else:
-            if type(resid1) == tuple:
+            if isinstance(resid1, tuple):
                 chain = resid1[0]
                 resn = resid1[1]
                 resid1 = resid1[2]
@@ -974,19 +978,26 @@ class ContactPCA:
         pd.DataFrame
 
         Columns are residue IDs and rows are principal component IDs.
-
+        Returns an empty DataFrame if no significant chacras have been
+        identified (i.e. ``self.top_chacras`` is empty).
         """
+        if not self.top_chacras:
+            return pd.DataFrame()
+
+        first_pc = self.top_chacras[0]
         results = {pc: {} for pc in self.top_chacras}
         for col in self.norm_loadings.index:
-            a, b = col.split("-")
-            if a not in results[1].keys():
+            # Contact IDs have exactly one '-' separator between the two residues
+            # e.g. 'A:ALA:5-B:GLY:10'  →  a='A:ALA:5', b='B:GLY:10'
+            a, b = split_id(col)["resa"], split_id(col)["resb"]
+            if a not in results[first_pc].keys():
                 for pc in self.top_chacras:
                     results[pc][a] = self.norm_loadings[f"PC{pc}"].loc[col] / 2
             else:
                 for pc in self.top_chacras:
                     results[pc][a] += self.norm_loadings[f"PC{pc}"].loc[col] / 2
 
-            if b not in results[1].keys():
+            if b not in results[first_pc].keys():
                 for pc in self.top_chacras:
                     results[pc][b] = self.norm_loadings[f"PC{pc}"].loc[col] / 2
             else:
@@ -998,7 +1009,7 @@ class ContactPCA:
         return pd.DataFrame(
             [result.values() for result in results.values()],
             index=results.keys(),
-            columns=results[1].keys(),
+            columns=results[first_pc].keys(),
         )
 
     def to_pymol(

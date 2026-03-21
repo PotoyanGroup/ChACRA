@@ -4,99 +4,164 @@ import shutil
 import subprocess
 import traceback
 from datetime import datetime
+
+import numpy as np
+
 from chacra.trajectories.process_hremd import *
+from chacra.utils import RunConfig
+
+_CONFIG_PATH = "chacra_run.json"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run HREMD simulation.")
+    parser = argparse.ArgumentParser(
+        description="Run HREMD simulation.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Config file (loaded before remaining args so CLI args can override) #
+    # ------------------------------------------------------------------ #
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to chacra_run.json.  Defaults to 'chacra_run.json' in the "
+             "current directory if it exists.  All values can be overridden "
+             "by the explicit CLI flags below.",
+    )
 
     # Add arguments for system file and structure
     parser.add_argument(
         "-p", "--system_file",
         type=str,
-        required=True,
+        default=None,
         help="Path to the system XML file.",
     )
     parser.add_argument(
         "-s", "--structure_file",
         type=str,
-        required=True,
+        default=None,
         help="Path to the structure PDB file.",
     )
     parser.add_argument(
         "-c", "--n_cycles",
         type=int,
-        default=10000,
-        help="The number of replica_exchange attempts for this run.",
+        default=None,
+        help="The number of replica exchange attempts for this run.",
     )
     parser.add_argument(
         "-j", "--n_jobs",
         type=int,
-        required=True,
-        help="The number of mpi processes to start.",
+        default=None,
+        help="The number of MPI processes to start.  For simulation this should "
+             "equal the number of available GPUs.  The analysis step "
+             "(process-output) uses a separate --n_jobs that can be set "
+             "independently for CPU-bound contact calculations.",
     )
     parser.add_argument(
         "-d", "--steps_per_cycle",
         type=int,
-        default=1000,
+        default=None,
         help="The number of timesteps between replica exchange attempts.",
     )
     parser.add_argument(
         "-l", "--min_temp",
         type=float,
-        default=290,
-        help="The minimum effective temperature (in kelvin) of the replica exchange ensemble.\
-                        This is the same as the solvent temperature for all replicas",
+        default=None,
+        help="The minimum effective temperature (K) of the replica exchange "
+             "ensemble.  Same as the solvent temperature for all replicas.",
     )
     parser.add_argument(
         "-x", "--max_temp",
         type=float,
-        default=450,
-        help="The maximum effective temperature (in kelvin) of the replica exchange ensemble.",
+        default=None,
+        help="The maximum effective temperature (K) of the replica exchange "
+             "ensemble.",
     )
     parser.add_argument(
-        "-n", "--n_systems", type=int, default=None, help="The number of replicas."
+        "-n", "--n_systems",
+        type=int,
+        default=None,
+        help="The number of replicas.",
     )
     parser.add_argument(
         "-i", "--save_interval",
         type=int,
-        default=10,
+        default=None,
         help="Save trajectory data at this cycle interval.",
     )
     parser.add_argument(
         "-k", "--checkpoint_interval",
         type=int,
-        default=500,
+        default=None,
         help="Save checkpoints at this cycle interval.",
     )
     parser.add_argument(
         "-w", "--warmup_steps",
         type=int,
-        default=0,
-        help="The number of warmup steps to run before starting replica exchange attempts.\
-                        Only necessary on the first run.",
+        default=None,
+        help="Warmup steps before replica exchange begins (first run only).",
     )
     parser.add_argument(
         "-b", "--lambda_selection",
         type=str,
-        default="protein",
-        help="The MDAnalysis selection to which the lambda scaling will be applied.",
+        default=None,
+        help="MDAnalysis selection to which lambda scaling is applied.",
     )
     parser.add_argument(
         "--output_selection",
         type=str,
-        default="protein",
-        help="MDAnalysis selection of atoms to write for state trajectories."
-        )
-    parser.add_argument(
-        "--timestep", type=int, required=False,
-        default=2,
-        help="""
-        Timestep in femtoseconds. Hydrogen mass repartitioning is recoommended 
-        for timesteps larger than 2 fs.
-        """,
+        default=None,
+        help="MDAnalysis selection of atoms to write for state trajectories.",
     )
+    parser.add_argument(
+        "--timestep",
+        type=int,
+        default=None,
+        help="Timestep in femtoseconds.  HMR recommended for timesteps > 2 fs.",
+    )
+
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------ #
+    # Load chacra_run.json, then fill any args still None from the config #
+    # ------------------------------------------------------------------ #
+    config_path = args.config or (_CONFIG_PATH if os.path.exists(_CONFIG_PATH) else None)
+    run_config = RunConfig(config_path)
+    run_config.apply_to_namespace(args)
+
+    # Apply hard-coded defaults for anything still None
+    _hard_defaults = {
+        "n_cycles": 1000,
+        "steps_per_cycle": 1000,
+        "min_temp": 290.0,
+        "max_temp": 450.0,
+        "save_interval": 10,
+        "checkpoint_interval": 500,
+        "warmup_steps": 0,
+        "lambda_selection": "protein",
+        "output_selection": "protein",
+        "timestep": 2,
+    }
+    for key, val in _hard_defaults.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, val)
+
+    # Validate required args
+    if args.system_file is None:
+        parser.error(
+            "--system_file is required (or set 'system_file' in chacra_run.json)."
+        )
+    if args.structure_file is None:
+        parser.error(
+            "--structure_file is required (or set 'structure_file' in chacra_run.json)."
+        )
+    if args.n_jobs is None:
+        parser.error(
+            "--n_jobs / -j is required."
+        )
 
     current_run = (
         len(
@@ -108,41 +173,38 @@ def main():
             ]
         )
         + 1
+        if os.path.isdir("./replica_trajectories")
+        else 1
     )
-    
+
     os.environ.setdefault("TQDM_DISABLE", "1")
     os.environ.setdefault("TQDM_MININTERVAL", "600")  # once every 10 minutes if enabled
     os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-    # check that default output fold does not exist or is empty
-    # if current_run is 1:
-    #     if os.path.exists('hremd-outputs/trajectories') or os.path.exists()
     if current_run > 1:
-        # Load data from the previous run
+        # Load data from the previous run to verify / infer n_systems
         df = load_femto_data(
             f"replica_trajectories/run_{current_run - 1}/samples.arrow"
         )
-        # Get the number of replicas from the data if not specified
+        n_systems_from_data = get_num_states(df)
         if args.n_systems is None:
-            n_systems = get_num_states(df)
-        elif args.n_systems == get_num_states(df):
-            n_systems = args.n_systems
+            n_systems = n_systems_from_data
+        elif args.n_systems != n_systems_from_data:
+            print(
+                f"Warning: --n_systems ({args.n_systems}) does not match "
+                f"previous runs ({n_systems_from_data}). "
+                f"Using {n_systems_from_data}."
+            )
+            n_systems = n_systems_from_data
         else:
-            n_systems = get_num_states(df)
-            print(
-                f"The number of replicas specified ({args.n_systems}) does not equal that of previous runs ({n_systems})."
-            )
-            print(
-                f"Using {n_systems} replicas. Start a new hremd project if you want to run with {args.n_systems} replicas."
-            )
+            n_systems = args.n_systems
     else:  # current_run == 1
         if args.n_systems is None:
-            print(
-                "This is the first run. You need to specify how many systems to create."
+            parser.error(
+                "--n_systems / -n is required on the first run "
+                "(or set 'n_systems' in chacra_run.json)."
             )
-            exit()
-        else:
-            n_systems = args.n_systems
+        n_systems = args.n_systems
 
     
     # Get the number of cycles run thus far
@@ -188,31 +250,58 @@ def main():
     ]
     
     
+    # Compute and cache the full temperature list so process-output and
+    # the JSON config don't need to re-derive it.
+    temps = np.geomspace(args.min_temp, args.max_temp, n_systems).tolist()
+
+    # ------------------------------------------------------------------ #
+    # Write / update chacra_run.json (first run creates it; later runs    #
+    # update current_run and any overridden fields).                      #
+    # ------------------------------------------------------------------ #
+    run_config.update(
+        system_file=args.system_file,
+        structure_file=args.structure_file,
+        n_systems=n_systems,
+        min_temp=args.min_temp,
+        max_temp=args.max_temp,
+        temps=temps,
+        n_cycles=args.n_cycles,
+        steps_per_cycle=args.steps_per_cycle,
+        save_interval=args.save_interval,
+        checkpoint_interval=args.checkpoint_interval,
+        warmup_steps=args.warmup_steps,
+        lambda_selection=args.lambda_selection,
+        output_selection=args.output_selection,
+        timestep=args.timestep,
+        n_jobs=args.n_jobs,
+        current_run=current_run,
+    )
+    run_config.write(_CONFIG_PATH)
+
     times = {}
-    
     times["start"] = datetime.now().strftime("%H:%M")
 
     try:
         log_dir = Path(f"./analysis_output/run_{current_run}")
         log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / "hremd_stdout.log", "wb") as out, open(log_dir / "hremd_stderr.log", "wb") as err:
+        with open(log_dir / "hremd_stdout.log", "wb") as out, \
+             open(log_dir / "hremd_stderr.log", "wb") as err:
             result = subprocess.run(
                 mpi_command,
                 stdout=out,
                 stderr=err,
-                check=True,  # Raises CalledProcessError for non-zero exit codes
-                env=os.environ.copy()
+                check=True,
+                env=os.environ.copy(),
             )
 
         print("Replica exchange completed:", result.returncode)
 
-        # Make the run output directories and move the output files
+        # Move femto output files to the run directory
         os.makedirs(f"./replica_trajectories/run_{current_run}")
         shutil.move(
             "./hremd-outputs/trajectories/",
             f"./replica_trajectories/run_{current_run}/",
         )
-
         shutil.move(
             "./hremd-outputs/samples.arrow",
             f"./replica_trajectories/run_{current_run}/samples.arrow",
@@ -221,10 +310,11 @@ def main():
             "./hremd-outputs/checkpoint.pkl",
             f"./replica_trajectories/run_{current_run}/checkpoint.pkl",
         )
-        
+
         times["end"] = datetime.now().strftime("%H:%M")
 
-        # Process the replicas to state trajectories and run analyses
+        # Process the replicas to state trajectories and run analyses.
+        # Pass --config so process-output reads temps/n_systems from JSON.
         analysis_command = [
             "process-output",
             "--run",
@@ -237,22 +327,21 @@ def main():
             str(args.save_interval),
             "--output_selection",
             args.output_selection,
-            "--min_temp",
-            str(args.min_temp),
-            "--max_temp",
-            str(args.max_temp),
-            "--n_systems",
-            str(n_systems),
+            "--config",
+            _CONFIG_PATH,
         ]
-        subprocess.run(analysis_command)
+        subprocess.run(analysis_command, check=False)
 
-        # write out run info
+        # Update current_run in JSON after successful completion
+        run_config.config["current_run"] = current_run
+        run_config.write(_CONFIG_PATH)
 
+        # Write human-readable stats
         with open(f"analysis_output/run_{current_run}/stats.txt", "w") as f:
-            f.write(f"{times}\n")
             f.write(f"{times['start']} to {times['end']}\n")
             f.write(f"n_systems : {n_systems}\n")
-            f.write(f"n_steps : {args.steps_per_cycle*args.n_cycles}\n")
+            f.write(f"temps     : {temps}\n")
+            f.write(f"n_steps   : {args.steps_per_cycle * args.n_cycles}\n")
             f.write(f"save_interval : {args.save_interval}\n")
             f.write(f"checkpoint_interval : {args.checkpoint_interval}\n")
 

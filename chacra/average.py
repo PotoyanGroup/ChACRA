@@ -633,7 +633,7 @@ def average_multimer(
     else:  # heteromultimer
         if len(identical_subunits) > 1:
             test_len = len(list(identical_subunits.values())[0])
-            if not np.alltrue(
+            if not np.all(
                 [len(val) == test_len for val in identical_subunits.values()]
             ):
                 print(
