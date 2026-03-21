@@ -714,6 +714,9 @@ class ContactPCA:
             index=list(contact_df.columns),
         )
         self.norm_loadings = _normalize(self.loadings)
+        # Cache for sorted_norm_loadings — invalidated whenever norm_loadings
+        # is reassigned (e.g. in CombinedChacra.separate_ensemble_loadings).
+        self._snl_cache: dict[int, pd.DataFrame] = {}
 
         # ensure that PC1 projection has a negative slope to reflect its
         # expected melting trend
@@ -764,6 +767,11 @@ class ContactPCA:
         Sort the normalized (positive 0 to 1) loading scores in descending
         order.
 
+        Results are cached per-PC so callers that need the same PC multiple
+        times (e.g. ``get_chacra_center``, ``get_flipped_contacts``,
+        ``to_pymol``) pay the sort cost only once.  The cache is invalidated
+        by calling ``clear_snl_cache()``.
+
         Parameters
         ----------
         pc : int
@@ -773,9 +781,20 @@ class ContactPCA:
         -------
         pd.DataFrame
         """
-        return self.norm_loadings.iloc[
-            (-self.norm_loadings["PC" + str(pc)].abs()).argsort()
-        ]
+        if pc not in self._snl_cache:
+            self._snl_cache[pc] = self.norm_loadings.iloc[
+                (-self.norm_loadings[f"PC{pc}"].abs()).argsort()
+            ]
+        return self._snl_cache[pc]
+
+    def clear_snl_cache(self) -> None:
+        """
+        Discard all cached ``sorted_norm_loadings`` results.
+
+        Call this after directly mutating ``self.norm_loadings`` (e.g. in
+        ``CombinedChacra.separate_ensemble_loadings``).
+        """
+        self._snl_cache.clear()
 
     def get_edges(self, pcs:list[int]|None=None, inverse:bool=True, 
                   as_dict:bool=False) -> list | dict:
@@ -1286,8 +1305,6 @@ class CombinedChacra:
         """
         Get contacts that have flipped loading scores on the same combined PC.
 
-        TODO - this is slow
-
         Parameters
         ----------
         cutoff : float
@@ -1304,51 +1321,50 @@ class CombinedChacra:
         List of contacts that have flipped loading scores on the shared principal
         components.
         """
-        print("This one takes a moment...")
         if pc_range is None:
             pcs = self.combined.cpca.top_chacras
         else:
             pcs = list(range(pc_range[0], pc_range[1] + 1))
 
+        cpca = self.combined.cpca
+
+        # Pre-compute the top-scoring PC for every contact across all PCs we
+        # care about.  This avoids calling get_top_score() inside the inner loop
+        # (which itself re-sorts norm_loadings each call).
+        pc_cols = [f"PC{pc}" for pc in pcs]
+        top_pc_per_contact: dict[str, int] = {
+            contact: pcs[
+                int(cpca.norm_loadings.loc[contact, pc_cols].values.argmax())
+            ]
+            for contact in cpca.norm_loadings.index
+        }
+
         different_signs = set()
         for pc in pcs:
+            pc_col = f"PC{pc}"
+            # Hoist both Series lookups out of the inner contact loop.
+            loadings_pc: pd.Series = cpca.loadings[pc_col]
+            norm_pc: pd.Series = cpca.sorted_norm_loadings(pc)[pc_col]
+
             for contact in self.shared_contacts:
-                # if they're opposite signs
                 contacta = f"{self.names[0]}_{contact}"
                 contactb = f"{self.names[1]}_{contact}"
+
+                # Skip pairs with the same sign.
+                la, lb = loadings_pc[contacta], loadings_pc[contactb]
+                if not ((la > 0 and lb < 0) or (la < 0 and lb > 0)):
+                    continue
+
+                # Skip if neither is above the cutoff.
+                if norm_pc.loc[contacta] < cutoff and norm_pc.loc[contactb] < cutoff:
+                    continue
+
+                # Include if at least one contact's primary chacra is this PC.
                 if (
-                    self.combined.cpca.loadings[f"PC{pc}"][contacta] > 0
-                    and self.combined.cpca.loadings[f"PC{pc}"][contactb] < 0
-                ) or (
-                    self.combined.cpca.loadings[f"PC{pc}"][contacta] < 0
-                    and self.combined.cpca.loadings[f"PC{pc}"][contactb] > 0
+                    top_pc_per_contact.get(contacta) == pc
+                    or top_pc_per_contact.get(contactb) == pc
                 ):
-                    # and at least one is above the cutoff
-                    if (
-                        self.combined.cpca.sorted_norm_loadings(pc)[
-                            f"PC{pc}"
-                        ].loc[contacta]
-                        < cutoff
-                    ) and (
-                        self.combined.cpca.sorted_norm_loadings(pc)[
-                            f"PC{pc}"
-                        ].loc[contactb]
-                        < cutoff
-                    ):
-                        pass
-                    # and at least one has its highest score on the current pc
-                    elif (
-                        list(self.combined.cpca.get_top_score(contacta).keys())[
-                            0
-                        ]
-                        == pc
-                    ) or (
-                        list(self.combined.cpca.get_top_score(contactb).keys())[
-                            0
-                        ]
-                        == pc
-                    ):
-                        different_signs.add(contact)
+                    different_signs.add(contact)
 
         return list(different_signs)
 
@@ -1491,3 +1507,5 @@ class CombinedChacra:
             self.separated_cpca[name].norm_loadings = self.separated_cpca[
                 name
             ].loadings
+            # norm_loadings was directly replaced — invalidate the sort cache
+            self.separated_cpca[name].clear_snl_cache()
