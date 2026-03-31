@@ -319,11 +319,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable,
-                Path(__file__).parent.parent.parent
-                / "external"
-                / "getcontacts"
-                / "get_dynamic_contacts.py",
+                "get-dynamic-contacts",
                 "--topology", selection_file,
                 "--trajectory", f"./state_trajectories/run_{run}/state_{i}.xtc",
                 "--output", str(contacts_out),
@@ -338,11 +334,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable,
-                Path(__file__).parent.parent.parent
-                / "external"
-                / "getcontacts"
-                / "get_contact_frequencies.py",
+                "get-contact-frequencies",
                 "--input_files", str(contacts_out),
                 "--output_file", str(freqs_out),
             ],

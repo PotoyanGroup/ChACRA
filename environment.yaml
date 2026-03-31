@@ -4,8 +4,6 @@ channels:
   - defaults
 
 dependencies:
-  - python<3.12  # getcontacts multiprocessing is not yet verified on 3.12
-
   # ── MPI ─────────────────────────────────────────────────────────────────
   # The *_external_* build tells conda-forge NOT to bundle its own libmpi.so
   # and instead link against the system OpenMPI at runtime.  This is required
