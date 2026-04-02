@@ -60,7 +60,7 @@ fi
 $CONDA_CMD env update -f environment.yaml --prune
 
 # 4. Pip post-install
-echo "Installing mpi4py from source, $CUPY_PKG, and femto..."
+echo "Installing mpi4py from source, $CUPY_PKG, femto, ultracontacts, and getcontacts..."
 # Get mpicc path
 SYSTEM_MPICC=$(which mpicc)
 
@@ -74,7 +74,7 @@ echo "Using MPICC=\$MPICC"
 # Install pip packages inside the conda env
 pip install --no-cache-dir $CUPY_PKG
 pip install --no-binary mpi4py --no-cache-dir mpi4py
-pip install --no-cache-dir git+https://github.com/Dan-Burns/femto.git@mps_hremd git+https://github.com/Dan-Burns/ultracontacts.git
+pip install --no-cache-dir git+https://github.com/Dan-Burns/femto.git git+https://github.com/Dan-Burns/ultracontacts.git git+https://github.com/Dan-Burns/getcontacts.git
 EOF
 
 chmod +x post_install_tmp.sh

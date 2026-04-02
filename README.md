@@ -29,7 +29,7 @@ Run the automated installation script. This script will:
 2. Detect your CUDA version and determine the correct `cupy` package.
 3. Create the conda environment (`chacra-env`).
 4. Install `mpi4py` built against your system MPI.
-5. Install the required custom `femto` fork with MPS oversubscription features.
+5. Install the `femto`, `ultracontacts`, and `getcontacts` main branches via pip.
 
 ```bash
 ./install.sh
@@ -110,8 +110,6 @@ If you set up a system with a ligand, you may not be able to run femto HREMD wit
 If you encounter particle NaN errors running HREMD, it's likely due to starting coordinates that aren't adequately energy minimized or equilibrated. 
 
 Another common error is related to CUDA driver version incompatibility with OpenMM dependencies. Check the analysis_output/run_x/ directory for hremd_stderr.log file for more information. The error log will show something like "CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222)". Refer to [OpenMM](https://github.com/openmm/openmm) docs and git issues. 
-
-Lastly, the getcontacts calculation get_dynamic_contacts.py can be run in parallel. However, when using lots of cores a memory allocation error can pop up. This might be resolved with the pinned python<3.12 in the environment.yaml. Please note it in a git issue if it happens.
 
 #### Citations
 Please cite the following if you use ChACRA.
