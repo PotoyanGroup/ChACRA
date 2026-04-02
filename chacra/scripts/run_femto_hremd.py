@@ -22,7 +22,8 @@ def main():
     import femto.md.simulate
     import femto.md.utils.openmm
     import openmm.unit
-    femto.md.utils.mpi.divide_gpus()
+    import sys
+    
     
     parser = argparse.ArgumentParser(description="Run HREMD simulation.")
 
@@ -111,6 +112,8 @@ def main():
         default=2
     )
     args = parser.parse_args()
+
+    femto.md.utils.mpi.divide_gpus()
     system_file = args.system_file
     with open(system_file, "r") as file:
         xml = file.read()

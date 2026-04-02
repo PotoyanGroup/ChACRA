@@ -10,6 +10,15 @@ import numpy as np
 from chacra.trajectories.process_hremd import *
 from chacra.utils import RunConfig
 
+
+def _find_mpirun() -> str | None:
+    """Return the first mpirun/mpiexec on PATH.
+
+    The conda environment's mpirun takes precedence (appears first on PATH),
+    which ensures ABI compatibility with the installed mpi4py.
+    """
+    return shutil.which("mpirun") or shutil.which("mpiexec")
+
 _CONFIG_PATH = "chacra_run.json"
 
 
@@ -122,6 +131,26 @@ def main():
         default=None,
         help="Timestep in femtoseconds.  HMR recommended for timesteps > 2 fs.",
     )
+    parser.add_argument(
+        "-o","--oversubscribe",
+        type=int,
+        default=1,
+        help="The number of replicas to run simultaneously on each GPU. "
+             "Default is 1 meaning that if you have 2 GPUs and 4 replicas, "
+             "2 replicas will be assigned to each GPU with each one running sequentially. "
+             "If oversubscribe is set to 2, then all 4 replicas will run "
+             "simultaneously on the 2 GPUs."
+    )
+    parser.add_argument(
+        "--mpi-command",
+        type=str,
+        default=None,
+        dest="mpi_command",
+        help="Path to the MPI launcher.  Auto-detected from PATH if not "
+             "specified.  The conda environment's mpirun is used by default "
+             "(ABI-compatible with the installed mpi4py).  Set this if your "
+             "cluster requires a specific launcher, e.g. 'srun --mpi=pmix'.",
+    )
 
     args = parser.parse_args()
 
@@ -217,37 +246,44 @@ def main():
         )
         total_cycles = cycles_completed + args.n_cycles
 
-    # Define the MPI command
-    mpi_command = [
-        "mpirun",
-        "-np",
-        str(args.n_jobs),
+    # ------------------------------------------------------------------ #
+    # Build run-femto args (run-femto always runs inside MPI now)         #
+    # ------------------------------------------------------------------ #
+    femto_args = [
         "run-femto",
-        "--system_file",
-        args.system_file,
-        "--structure_file",
-        args.structure_file,
-        "--n_cycles",
-        str(total_cycles),
-        "--steps_per_cycle",
-        str(args.steps_per_cycle),
-        "--min_temp",
-        str(args.min_temp),
-        "--max_temp",
-        str(args.max_temp),
-        "--n_systems",
-        str(n_systems),
-        "--save_interval",
-        str(args.save_interval),
-        "--checkpoint_interval",
-        str(args.checkpoint_interval),
-        "--warmup_steps",
-        str(args.warmup_steps),
-        "--lambda_selection",
-        args.lambda_selection,
-        "--timestep",
-        str(args.timestep)
+        "--system_file",   args.system_file,
+        "--structure_file", args.structure_file,
+        "--n_cycles",      str(total_cycles),
+        "--steps_per_cycle", str(args.steps_per_cycle),
+        "--min_temp",      str(args.min_temp),
+        "--max_temp",      str(args.max_temp),
+        "--n_systems",     str(n_systems),
+        "--save_interval", str(args.save_interval),
+        "--checkpoint_interval", str(args.checkpoint_interval),
+        "--warmup_steps",  str(args.warmup_steps),
+        "--lambda_selection", args.lambda_selection,
+        "--timestep",      str(args.timestep),
     ]
+
+    # Total MPI ranks = GPUs-in-use × oversubscription factor
+    n_total_ranks = args.n_jobs * args.oversubscribe
+
+    # Use the mpirun on PATH (conda env's mpirun takes precedence and is
+    # ABI-compatible with the installed mpi4py).  Override with --mpi-command
+    # if your cluster requires a specific launcher.
+    if args.mpi_command:
+        mpirun = args.mpi_command
+    else:
+        mpirun = _find_mpirun()
+    if mpirun is None:
+        raise RuntimeError(
+            "Cannot find mpirun or mpiexec on PATH. "
+            "Install OpenMPI (e.g. sudo apt install openmpi-bin) or add it to PATH."
+        )
+    print(f"Using mpirun: {mpirun}  ({n_total_ranks} ranks on {args.n_jobs} GPU(s) "
+          f"× oversubscribe={args.oversubscribe})")
+
+    mpi_command = [mpirun, "-np", str(n_total_ranks), "--oversubscribe"] + femto_args
     
     
     # Compute and cache the full temperature list so process-output and
@@ -281,6 +317,18 @@ def main():
     times = {}
     times["start"] = datetime.now().strftime("%H:%M")
 
+    # Prepare MPS-aware environment for oversubscribed runs
+    run_env = os.environ.copy()
+    if args.oversubscribe > 1:
+        import femto.md.utils.mpi as _fmpi
+        thread_pct = max(1, 200 // args.oversubscribe)
+        run_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(thread_pct)
+        print(f"MPS oversubscribe={args.oversubscribe}: "
+              f"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={thread_pct}%")
+        if not _fmpi.is_mps_running():
+            print("Starting CUDA MPS daemon...")
+            _fmpi.start_mps()
+
     try:
         log_dir = Path(f"./analysis_output/run_{current_run}")
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -291,7 +339,7 @@ def main():
                 stdout=out,
                 stderr=err,
                 check=True,
-                env=os.environ.copy(),
+                env=run_env,
             )
 
         print("Replica exchange completed:", result.returncode)
