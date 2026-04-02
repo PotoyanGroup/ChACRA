@@ -4,39 +4,40 @@ channels:
   - defaults
 
 dependencies:
-  # ── MPI ─────────────────────────────────────────────────────────────────
-  # The *_external_* build tells conda-forge NOT to bundle its own libmpi.so
-  # and instead link against the system OpenMPI at runtime.  This is required
-  # for HREMD to distribute across all GPUs on a multi-GPU workstation
-  # (or across nodes on a cluster) — without it, all MPI processes land on
-  # the same GPU.
-  #
-  # Your system OpenMPI must be >= 4.1 and discoverable on PATH / LD_LIBRARY_PATH.
-  # Check with:  mpirun --version
-  - openmpi>=4.1 * *_external_*
-  #
-  # If the above line fails to resolve (e.g. the external build for your
-  # OS/arch isn't in the channel yet), fall back to the bundled build below —
-  # but note that HREMD will only run on a single GPU:
-  #
-  #   - openmpi>=4.1
-  # ────────────────────────────────────────────────────────────────────────
-
-  - femto
-
-  # openmm is a transitive dependency of femto. If the auto-selected version
-  # doesn't match your CUDA driver, add an explicit pin here, e.g.:
-  #   - openmm=8.1.2
-
-  - mdanalysis>=2.9.0
+  # ── Core simulation ────────────────────────────────────────────────────
+  - openmm>=8.1
+  - openmmforcefields
   - pdbfixer
-  - pandas
+
+  # ── femto dependencies (conda-only packages) ──────────────────────────
+  # femto itself is installed via pip in install.sh (from the ChACRA fork).
+  # These packages are NOT on PyPI and must come from conda-forge.
+  - mdtop
+  - pydantic-units
+
+  # ── femto dependencies (also on PyPI, but pre-installed via conda for
+  #    speed / binary builds) ────────────────────────────────────────────
+  - numpy
   - scipy
+  - pydantic>=2
+  - click
+  - cloup
+  - pyarrow
   - tqdm
+  - pyyaml
+  - pandas
+  - omegaconf
+  - gputil
+  - sympy
+  - pymbar>=4
+  - networkx
+  - mdtraj
+  - rdkit
+
+  # ── ChACRA core ───────────────────────────────────────────────────────
+  - mdanalysis>=2.9.0
   - matplotlib
   - scikit-learn
-  - networkx
   - nglview
-  - pre-commit
-  - vmd-python=3.1.4
   - prolif
+  - pre-commit
