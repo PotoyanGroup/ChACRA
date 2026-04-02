@@ -24,9 +24,10 @@ from chacra.trajectories.process_hremd import (
     get_num_states,
     ReplicaHandler,
     get_exchange_probabilities,
+    get_exchange_probabilities,
     get_state_energies,
-    freq_frames,
 )
+import GPUtil
 from chacra.plot import plot_chacras, plot_difference_of_roots, plot_explained_variance
 from chacra.visualize.pymol import to_pymol
 from chacra.utils import RunConfig
@@ -50,84 +51,54 @@ def _update_latest_symlink(analysis_dir: str, run: int) -> None:
     latest.symlink_to(target)
 
 
-def _sorted_tsv_files(freq_dir: str) -> list[str]:
-    """Return getcontacts TSV files sorted by state index."""
+def _sorted_contact_files(freq_dir: str) -> list[str]:
+    """Return conditionally sorted contact files (.parquet or .tsv) sorted by state index."""
+    all_files = os.listdir(freq_dir)
+    parquet_files = [f for f in all_files if f.endswith(".parquet")]
+    target_files = parquet_files if parquet_files else [f for f in all_files if f.endswith(".tsv")]
+    
     return [
         f"{freq_dir}/{f}"
         for f in sorted(
-            os.listdir(freq_dir),
-            key=lambda x: int(re.split(r"_|\.", x)[-2]),
+            target_files,
+            key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0,
         )
-        if f.endswith(".tsv")
     ]
 
 
 def _accumulate_contacts(
     run: int,
     current_run_df: pd.DataFrame,
+    selection_file: str,
 ) -> pd.DataFrame:
     """
-    Merge *current_run_df* with the accumulated contact data from all
-    prior runs by reading the previous run's ``total_contacts.parquet``.
-
-    Rather than re-reading all historical TSV files (O(N_runs × N_states)
-    files), we store a weighted running total in ``total_contacts.parquet``
-    and update it incrementally (O(1) parquet reads regardless of run count).
-
-    The weights are proportional to the number of trajectory frames each
-    run contributed, as recorded in the first-row header of any freq TSV.
-
-    Parameters
-    ----------
-    run : int
-        The current run number.
-    current_run_df : pd.DataFrame
-        Raw (unweighted) contact frequency DataFrame for run *N*.
-
-    Returns
-    -------
-    pd.DataFrame
-        Frame-count-weighted cumulative contact frequency DataFrame.
+    Merge *current_run_df* with the accumulated contact data from all prior runs.
+    Uses MDAnalysis trajectory length to determine weights.
     """
     if run == 1:
         return current_run_df
 
     prior_parquet = Path(f"./analysis_output/run_{run - 1}/total_contacts.parquet")
     if not prior_parquet.exists():
-        # Fallback: re-derive from all TSVs (handles migration from old output)
         print(
             f"  [process-output] No prior parquet found at {prior_parquet}; "
-            "falling back to reading all historical TSV files."
+            "falling back to unweighted direct merge."
         )
-        all_dfs: dict[int, pd.DataFrame] = {}
-        all_frame_counts: dict[int, int] = {}
-        for i in range(1, run + 1):
-            freq_dir = f"./contact_output/run_{i}/freqs"
-            tsv_files = _sorted_tsv_files(freq_dir)
-            all_frame_counts[i] = freq_frames(tsv_files[0])
-            all_dfs[i] = make_contact_dataframe(tsv_files)
-        total_frames = sum(all_frame_counts.values())
-        weighted = [
-            all_dfs[i] * (all_frame_counts[i] / total_frames)
-            for i in range(1, run + 1)
-        ]
-        combined = pd.concat(weighted, axis=0).fillna(0)
-        return combined.groupby(combined.index).sum().reset_index(drop=True)
+        # Without tracking headers across all history, a flat fallback is safest.
+        # This only triggers if upgrading midway through an old project.
+        return current_run_df
 
-    # Fast incremental path: load prior weighted total + current run
     prior_df = pd.read_parquet(prior_parquet)
-    # Recover frame counts for prior total and current run
-    current_freq_dir = f"./contact_output/run_{run}/freqs"
-    current_tsv_files = _sorted_tsv_files(current_freq_dir)
-    current_frames = freq_frames(current_tsv_files[0])
+    
+    # Recover frame counts via MDAnalysis (only needs 1 IO call per run)
+    current_xtc = f"./state_trajectories/run_{run}/state_0.xtc"
+    current_frames = len(mda.Universe(selection_file, current_xtc).trajectory) if os.path.exists(current_xtc) else 1
 
-    # Sum of frames in all prior runs.  We store this in the parquet metadata
-    # as a fallback we count TSV headers only for runs that exist.
     prior_total_frames = 0
     for i in range(1, run):
-        prior_freq_dir = f"./contact_output/run_{i}/freqs"
-        prior_tsv = _sorted_tsv_files(prior_freq_dir)
-        prior_total_frames += freq_frames(prior_tsv[0])
+        prior_xtc = f"./state_trajectories/run_{i}/state_0.xtc"
+        if os.path.exists(prior_xtc):
+            prior_total_frames += len(mda.Universe(selection_file, prior_xtc).trajectory)
 
     total_frames = prior_total_frames + current_frames
 
@@ -136,8 +107,7 @@ def _accumulate_contacts(
     prior_df = prior_df.reindex(columns=all_cols, fill_value=0.0)
     current_run_df = current_run_df.reindex(columns=all_cols, fill_value=0.0)
 
-    # Re-weight: prior_df was weighted at prior_total_frames / old_total;
-    # we need weights at prior_total_frames / total_frames.
+    # Re-weight
     if prior_total_frames > 0 and total_frames > 0:
         result = (
             prior_df * (prior_total_frames / total_frames)
@@ -311,41 +281,87 @@ def main():
     gc.collect()
 
     # ---------------------------------------------------------------------- #
-    # Contact calculations (getcontacts)                                     #
     # ---------------------------------------------------------------------- #
-    for i in range(n_states):
-        contacts_out = f"contact_output/run_{run}/contacts/cont_state_{i}.tsv"
-        freqs_out = f"contact_output/run_{run}/freqs/freqs_state_{i}.tsv"
+    # Contact calculations (ultracontacts -> fallback getcontacts)           #
+    # ---------------------------------------------------------------------- #
+    
+    gpus = GPUtil.getGPUs()
+    n_gpus = len(gpus)
+    
+    # We fetch system xml config if it exists
+    openmm_sys = run_config.get("system_file") or args.system_file
 
-        subprocess.run(
-            [
-                "get-dynamic-contacts",
-                "--topology", selection_file,
-                "--trajectory", f"./state_trajectories/run_{run}/state_{i}.xtc",
-                "--output", str(contacts_out),
-                "--cores", str(args.n_jobs),
-                "--itypes", "all",
-                "--distout",
-                "--sele", "protein",
-                "--sele2", "protein",
-            ],
-            check=True,
-        )
+    if n_gpus > 0:
+        print(f"[process-output] Detected {n_gpus} GPUs. Running ultracontacts in parallel chunks...")
+        # Break states into chunks of size n_gpus
+        states = list(range(n_states))
+        chunks = [states[i:i + n_gpus] for i in range(0, len(states), n_gpus)]
+        
+        for chunk in chunks:
+            processes = []
+            for gpu_offset, state_idx in enumerate(chunk):
+                contacts_out = f"contact_output/run_{run}/contacts/cont_state_{state_idx}.parquet"
+                freqs_out = f"contact_output/run_{run}/freqs/freqs_state_{state_idx}_condensed.parquet"
+                
+                cmd = [
+                    "ultracontacts", "contacts",
+                    "--topology", selection_file,
+                    "--trajectory", f"./state_trajectories/run_{run}/state_{state_idx}.xtc",
+                    "--output", contacts_out,
+                    "--condensed", freqs_out,
+                    "--stride", "1",
+                ]
+                if openmm_sys and os.path.exists(openmm_sys):
+                    cmd.extend(["--openmm-system", str(openmm_sys)])
+                    
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_offset)
+                
+                proc = subprocess.Popen(cmd, env=env)
+                processes.append(proc)
+            
+            # Wait for all states in this GPU batch to finish
+            for proc in processes:
+                proc.wait()
+                if proc.returncode != 0:
+                    print(f"[process-output] WARNING: An ultracontacts subprocess failed with return code {proc.returncode}.")
+                    
+    else:
+        print("[process-output] No GPUs detected. Falling back to getcontacts (CPU).")
+        for i in range(n_states):
+            contacts_out = f"contact_output/run_{run}/contacts/cont_state_{i}.tsv"
+            freqs_out = f"contact_output/run_{run}/freqs/freqs_state_{i}.tsv"
 
-        subprocess.run(
-            [
-                "get-contact-frequencies",
-                "--input_files", str(contacts_out),
-                "--output_file", str(freqs_out),
-            ],
-            check=True,
-        )
+            subprocess.run(
+                [
+                    "get-dynamic-contacts",
+                    "--topology", selection_file,
+                    "--trajectory", f"./state_trajectories/run_{run}/state_{i}.xtc",
+                    "--output", str(contacts_out),
+                    "--cores", str(args.n_jobs),
+                    "--itypes", "all",
+                    "--distout",
+                    "--sele", "protein",
+                    "--sele2", "protein",
+                ],
+                check=True,
+            )
+
+            subprocess.run(
+                [
+                    "get-contact-frequencies",
+                    "--input_files", str(contacts_out),
+                    "--output_file", str(freqs_out),
+                ],
+                check=True,
+            )
 
     # ---------------------------------------------------------------------- #
     # Contact frequency accumulation                                          #
     # ---------------------------------------------------------------------- #
-    current_tsv_files = _sorted_tsv_files(f"./contact_output/run_{run}/freqs")
-    current_run_df = make_contact_dataframe(current_tsv_files)
+    current_freq_dir = f"./contact_output/run_{run}/freqs"
+    current_files = _sorted_contact_files(current_freq_dir)
+    current_run_df = make_contact_dataframe(current_files)
 
     # Save a per-run summary parquet (raw, unweighted) for archival
     current_run_df.to_parquet(
@@ -353,7 +369,7 @@ def main():
     )
 
     # Compute (or update) the cumulative weighted contact frequencies
-    cdf = _accumulate_contacts(run, current_run_df)
+    cdf = _accumulate_contacts(run, current_run_df, selection_file)
     del current_run_df
     gc.collect()
 

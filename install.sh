@@ -74,7 +74,7 @@ echo "Using MPICC=\$MPICC"
 # Install pip packages inside the conda env
 pip install --no-cache-dir $CUPY_PKG
 pip install --no-binary mpi4py --no-cache-dir mpi4py
-pip install --no-cache-dir git+https://github.com/Dan-Burns/femto.git@mps_hremd
+pip install --no-cache-dir git+https://github.com/Dan-Burns/femto.git@mps_hremd git+https://github.com/Dan-Burns/ultracontacts.git
 EOF
 
 chmod +x post_install_tmp.sh

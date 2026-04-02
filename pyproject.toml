@@ -29,7 +29,9 @@ dependencies = [
     "joblib",
     "psutil",
     "biopython",
+    "GPUtil",
     "getcontacts @ git+https://github.com/Dan-Burns/getcontacts@AG_Refactor",
+    "ultracontacts @ git+https://github.com/Dan-Burns/ultracontacts",
 ]
 
 [project.optional-dependencies]

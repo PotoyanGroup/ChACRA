@@ -81,19 +81,32 @@ def make_contact_dataframe(
     """
     if isinstance(freq_files, list):
         contact_files = freq_files
+        is_parquet = any(str(f).endswith(".parquet") for f in contact_files)
     else:
+        all_files = os.listdir(freq_files)
+        parquet_files = [f for f in all_files if f.endswith(".parquet")]
+        is_parquet = len(parquet_files) > 0
+
+        target_files = parquet_files if is_parquet else [f for f in all_files if f.endswith(".tsv")]
+        
         contact_files = [
             f"{freq_files}/{file}"
             for file in sorted(
-                os.listdir(freq_files),
-                key=lambda x: int(re.split(r"_|\.", x)[-2]),
+                target_files,
+                key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0,
             )
-            if file.endswith(".tsv")
         ]
 
-    series_list = [load_contact_file(fp) for fp in contact_files]
+    if is_parquet:
+        # Ultracontacts condensed .parquet files are 1-row wide dataframes
+        combined_df = pd.concat(
+            [pd.read_parquet(fp) for fp in contact_files], axis=0, ignore_index=True
+        ).fillna(0)
+    else:
+        # Legacy getcontacts TSV loading
+        series_list = [load_contact_file(fp) for fp in contact_files]
+        combined_df = pd.DataFrame(series_list).fillna(0)
 
-    combined_df = pd.DataFrame(series_list).fillna(0)
     if temps is not None:
         combined_df.index = temps
     else:
