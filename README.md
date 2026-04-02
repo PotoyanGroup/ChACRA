@@ -15,37 +15,33 @@ With ChACRA you can run the full pipeline including the replica exchange simulat
 
 ### Installation
 
+To run ChACRA's replica exchange simulations across multiple GPUs, you must have OpenMPI and NVIDIA drivers installed on your system.
+
 Clone and enter the repository.
 
-```
-git clone --recurse-submodules https://github.com/Dan-Burns/ChACRA.git \
-&& cd ChACRA
-```
-
-To ensure that replica exchange will run in parallel, you need to specify a local mpi installation in the environment.yaml file. Get your mpi version.
-
-```
-mpirun --version
+```bash
+git clone https://github.com/Dan-Burns/ChACRA.git
+cd ChACRA
 ```
 
-And then edit the following line in the environment.yaml to reflect what the previous command returned.
+Run the automated installation script. This script will:
+1. Verify system prerequisites (`mpicc`, `nvidia-smi`).
+2. Detect your CUDA version and determine the correct `cupy` package.
+3. Create the conda environment (`chacra-env`).
+4. Install `mpi4py` built against your system MPI.
+5. Install the required custom `femto` fork with MPS oversubscription features.
 
-```
-- openmpi=4.1.6=*external*
+```bash
+./install.sh
 ```
 
-Then create the environment. It's recommended to use [mamba](https://mamba.readthedocs.io/en/latest/installation/mamba-installation.html) or [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html).
-
-```
-micromamba env create -f environment.yaml 
-```
-And activate it.
-```
+And activate the environment:
+```bash
 conda activate chacra-env
 ```
 
 Then install ChACRA (while inside the ChACRA repository).
-```
+```bash
 pip install -e .
 ```
 ### Usage
