@@ -1,43 +1,50 @@
 name: chacra-env
 channels:
-  - conda-forge
-  - defaults
+  - conda-forge  # single channel = no cross-channel ABI conflicts, fast solve
 
 dependencies:
-  # ── Core simulation ────────────────────────────────────────────────────
+  - python>=3.10,<3.13  # 3.12 OK now (getcontacts forkserver fix); 3.13 lacks builds for many sci-stack pkgs
+
+  # ── VMD (required by getcontacts) ────────────────────────────────────────
+  - vmd-python
+
+  # ── MPI ──────────────────────────────────────────────────────────────────
+  # No conda openmpi — mpi4py is pip-installed in install.sh and builds
+  # directly against the system MPI (mpicc must be on PATH).
+  # This avoids conda compiler_compat/ld conflicts and ensures all GPUs
+  # are engaged for HREMD.
+
+  # ── Core simulation ───────────────────────────────────────────────────────
   - openmm>=8.1
   - openmmforcefields
   - pdbfixer
 
-  # ── femto dependencies (conda-only packages) ──────────────────────────
-  # femto itself is installed via pip in install.sh (from the ChACRA fork).
-  # These packages are NOT on PyPI and must come from conda-forge.
+  # ── femto dependencies (conda-only) ───────────────────────────────────────
+  # femto itself is pip-installed in install.sh (Dan-Burns fork).
   - mdtop
   - pydantic-units
 
-  # ── femto dependencies (also on PyPI, but pre-installed via conda for
-  #    speed / binary builds) ────────────────────────────────────────────
+  # ── Scientific stack ──────────────────────────────────────────────────────
   - numpy
   - scipy
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - networkx
+  - pyarrow
+  - sympy
+
+  - rdkit
+  - mdtraj
+  - mdanalysis>=2.9.0
+
+  # ── Utilities ─────────────────────────────────────────────────────────────
   - pydantic>=2
   - click
   - cloup
-  - pyarrow
   - tqdm
   - pyyaml
-  - pandas
   - omegaconf
   - gputil
-  - sympy
-  - pymbar>=4
-  - networkx
-  - mdtraj
-  - rdkit
-
-  # ── ChACRA core ───────────────────────────────────────────────────────
-  - mdanalysis>=2.9.0
-  - matplotlib
-  - scikit-learn
   - nglview
-  - prolif
   - pre-commit

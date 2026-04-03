@@ -3,19 +3,22 @@ set -e
 
 echo "=== ChACRA Automated Installation ==="
 
-# 1. System checks
-if ! command -v conda &> /dev/null && ! command -v mamba &> /dev/null; then
-    echo "Error: conda or mamba must be installed."
+# ── 1. System checks ──────────────────────────────────────────────────────────
+
+if ! command -v conda &> /dev/null && ! command -v mamba &> /dev/null && ! command -v micromamba &> /dev/null; then
+    echo "Error: conda, mamba, or micromamba must be installed."
     exit 1
 fi
 
 if ! command -v mpicc &> /dev/null; then
-    echo "Error: mpicc not found. Please install the OpenMPI development headers (e.g., sudo apt install libopenmpi-dev openmpi-bin)."
+    echo "Error: mpicc not found. Please install the OpenMPI development headers."
+    echo "  e.g.  sudo apt install libopenmpi-dev openmpi-bin"
     exit 1
 fi
 
 if ! command -v mpirun &> /dev/null; then
-    echo "Error: mpirun not found. Please install OpenMPI (e.g., sudo apt install openmpi-bin)."
+    echo "Error: mpirun not found. Please install OpenMPI."
+    echo "  e.g.  sudo apt install openmpi-bin"
     exit 1
 fi
 
@@ -24,8 +27,8 @@ if ! command -v nvidia-smi &> /dev/null; then
     exit 1
 fi
 
-# 2. Extract CUDA version and determine CuPy package
-# nvidia-smi outputs something like "CUDA Version: 13.0"
+# ── 2. Detect CUDA version and select CuPy wheel ─────────────────────────────
+
 CUDA_VER=$(nvidia-smi | grep -Eo 'CUDA Version: [0-9]+\.[0-9]+' | grep -Eo '[0-9]+\.[0-9]+' | head -1)
 if [ -z "$CUDA_VER" ]; then
     echo "Warning: Could not detect CUDA version from nvidia-smi. Defaulting to cupy-cuda12x."
@@ -35,7 +38,6 @@ else
     if [ "$MAJOR" == "11" ]; then
         CUPY_PKG="cupy-cuda11x"
     elif [ "$MAJOR" == "12" ] || [ "$MAJOR" == "13" ]; then
-        # CuPy 12x wheels are used for CUDA 13 as well as 12
         CUPY_PKG="cupy-cuda12x"
     else
         echo "Warning: Unrecognized CUDA major version ($MAJOR). Defaulting to cupy-cuda12x."
@@ -44,43 +46,62 @@ else
 fi
 echo "Detected CUDA Version: $CUDA_VER. Will install $CUPY_PKG."
 
-# 3. Create conda base environment
-echo "Creating conda environment from environment.yaml..."
-CONDA_CMD="conda"
-if command -v mamba &> /dev/null; then
-    CONDA_CMD="mamba"
-fi
+# ── 3. Pick the best available conda frontend ─────────────────────────────────
+# Prefer micromamba > mamba > conda (faster solve, same interface)
 
-# Read environment name from yaml file
+if command -v micromamba &> /dev/null; then
+    CONDA_CMD="micromamba"
+elif command -v mamba &> /dev/null; then
+    CONDA_CMD="mamba"
+else
+    CONDA_CMD="conda"
+fi
+echo "Using conda frontend: $CONDA_CMD"
+
+# ── 4. Create / update the conda environment ──────────────────────────────────
+
 ENV_NAME=$(grep -E "^name:" environment.yaml | awk '{print $2}')
 if [ -z "$ENV_NAME" ]; then
     ENV_NAME="chacra-env"
 fi
+echo "Target environment: $ENV_NAME"
 
+echo "Creating/updating conda environment from environment.yaml..."
 $CONDA_CMD env update -f environment.yaml --prune
 
-# 4. Pip post-install
-echo "Installing mpi4py from source, $CUPY_PKG, femto, ultracontacts, and getcontacts..."
-# Get mpicc path
-SYSTEM_MPICC=$(which mpicc)
+# ── 5. Pip post-install (runs *inside* the conda env) ────────────────────────
+#
+# mpi4py builds against the system MPI (mpicc must be on PATH).
+# No conda openmpi is installed — this avoids compiler_compat conflicts
+# and ensures mpi4py links against the same libmpi that mpirun uses.
+
+echo "Installing $CUPY_PKG, mpi4py, femto, getcontacts, and ultracontacts..."
 
 cat << EOF > post_install_tmp.sh
 #!/bin/bash
 set -e
-export MPICC=$SYSTEM_MPICC
 
-echo "Using MPICC=\$MPICC"
+echo "Building mpi4py against system MPI (mpicc=$(which mpicc))"
 
-# Install pip packages inside the conda env
 pip install --no-cache-dir $CUPY_PKG
-pip install --no-binary mpi4py --no-cache-dir mpi4py
-pip install --no-cache-dir git+https://github.com/Dan-Burns/femto.git git+https://github.com/Dan-Burns/ultracontacts.git git+https://github.com/Dan-Burns/getcontacts.git
+pip install --no-cache-dir mpi4py
+pip install --no-cache-dir "git+https://github.com/Dan-Burns/femto.git"
+
+# getcontacts declares vmd-python (conda-only, not on PyPI) and
+# ultracontacts declares cupy (generic, can't build from source).
+# Both are already satisfied by the conda env + cupy-cudaXX above.
+pip install --no-cache-dir --no-deps "git+https://github.com/Dan-Burns/getcontacts.git"
+pip install --no-cache-dir --no-deps "git+https://github.com/Dan-Burns/ultracontacts.git"
+
+# Install ChACRA itself in editable mode so local edits are reflected.
+pip install --no-cache-dir -e "$(pwd)"
 EOF
 
 chmod +x post_install_tmp.sh
-$CONDA_CMD run -n "$ENV_NAME" ./post_install_tmp.sh
+$CONDA_CMD run -n "$ENV_NAME" bash post_install_tmp.sh
 rm post_install_tmp.sh
 
+echo ""
 echo "=== Installation Complete ==="
-echo "You can now activate the environment:"
+echo "Activate the environment with:"
 echo "    conda activate $ENV_NAME"

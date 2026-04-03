@@ -30,8 +30,6 @@ dependencies = [
     "psutil",
     "biopython",
     "GPUtil",
-    "getcontacts @ git+https://github.com/Dan-Burns/getcontacts",
-    "ultracontacts @ git+https://github.com/Dan-Burns/ultracontacts",
 ]
 
 [project.optional-dependencies]

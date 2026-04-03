@@ -35,14 +35,9 @@ Run the automated installation script. This script will:
 ./install.sh
 ```
 
-And activate the environment:
+Then activate the environment:
 ```bash
 conda activate chacra-env
-```
-
-Then install ChACRA (while inside the ChACRA repository).
-```bash
-pip install -e .
 ```
 ### Usage
 #### Run an example
