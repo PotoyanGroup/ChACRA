@@ -969,7 +969,7 @@ class ContactPCA:
         self._N_permutations = N_permutations
 
         n_cores = cpu_count()
-        if (n_jobs == None) or (n_jobs > n_cores):
+        if n_jobs is None or n_jobs <= 0 or n_jobs > n_cores:
             n_jobs = n_cores
 
         # Split total permutations across processes
