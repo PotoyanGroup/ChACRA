@@ -22,6 +22,7 @@ COMMANDS = {
     "run-hremd":          "chacra.scripts.run_hremd",
     "run-femto":          "chacra.scripts.run_femto_hremd",
     "process-output":     "chacra.scripts.process_hremd_output",
+    "check-convergence":  "chacra.scripts.check_convergence",
     "make-simulation":    "chacra.scripts.make_simulation",
     "project":            "chacra.scripts.project_setup",
     "get-state-contacts": "chacra.scripts.get_state_contacts",
