@@ -1057,7 +1057,7 @@ class ContactPCA:
         cutoff:float=0.6,
         output:str|os.PathLike="chacra_selections.pml",
         group_pcs:bool=True,
-        scale_spheres:bool=False,
+        scale_spheres:bool=True,
         sphere_scale_range:tuple[float]=(0.6, 1.5),
         reconstruct_from_averaged:bool=False,
         original_contacts:pd.DataFrame|None=None,

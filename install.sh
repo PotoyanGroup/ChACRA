@@ -28,28 +28,47 @@ if ! command -v nvidia-smi &> /dev/null; then
 fi
 
 # ── 2. Detect CUDA version from the driver ────────────────────────────────────
-# nvidia-smi reports the highest CUDA version the *driver* supports.
-# We pin cuda-version to this exact value so that the CUDA runtime
-# packages (cuda-nvrtc, libcufft, etc.) match the driver and we avoid
-# CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222).
+# nvidia-smi reports the highest CUDA toolkit the *driver* supports.
+# We use CONDA_OVERRIDE_CUDA to tell the solver what virtual CUDA
+# package to assume.  We do NOT inject a hard cuda-version pin into the
+# environment spec because conda-forge may not yet have builds for the
+# exact driver version (e.g. 13.0) — that would make the solve impossible.
 
 CUDA_VER=$(nvidia-smi | grep -Eo 'CUDA Version: [0-9]+\.[0-9]+' | grep -Eo '[0-9]+\.[0-9]+' | head -1)
 if [ -z "$CUDA_VER" ]; then
     echo "Warning: Could not detect CUDA version from nvidia-smi."
-    echo "         Conda will pick the default CUDA variant — this may cause PTX errors."
+    echo "         Conda will pick the default CUDA variant."
     CUDA_MAJOR=""
+    CONDA_CUDA_OVERRIDE=""
 else
     CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
     echo "Detected driver CUDA version: $CUDA_VER (major=$CUDA_MAJOR)"
+
+    # conda-forge packages are built against specific CUDA versions.
+    # If the driver supports 13.x, packages built for 12.x are still
+    # compatible (forward-compat).  Map to the latest conda-forge
+    # CUDA version that actually has builds.
+    if [ "$CUDA_MAJOR" -ge 13 ] 2>/dev/null; then
+        # CUDA 13+ driver: use 12.x builds (forward-compatible)
+        CONDA_CUDA_OVERRIDE="12.8"
+        echo "  Driver CUDA >= 13 — using CUDA 12.8 builds (forward-compatible)"
+    elif [ "$CUDA_MAJOR" == "12" ]; then
+        CONDA_CUDA_OVERRIDE="$CUDA_VER"
+    elif [ "$CUDA_MAJOR" == "11" ]; then
+        CONDA_CUDA_OVERRIDE="$CUDA_VER"
+    else
+        CONDA_CUDA_OVERRIDE=""
+    fi
 fi
 
 # Select the correct CuPy wheel
 if [ "$CUDA_MAJOR" == "11" ]; then
     CUPY_PKG="cupy-cuda11x"
-elif [ "$CUDA_MAJOR" == "12" ] || [ "$CUDA_MAJOR" == "13" ]; then
+elif [ -n "$CUDA_MAJOR" ]; then
+    # CUDA 12.x, 13.x, and future versions all use the 12x wheel
     CUPY_PKG="cupy-cuda12x"
 else
-    echo "Warning: Unrecognized or missing CUDA major version ($CUDA_MAJOR). Defaulting to cupy-cuda12x."
+    echo "Warning: Unrecognized CUDA version. Defaulting to cupy-cuda12x."
     CUPY_PKG="cupy-cuda12x"
 fi
 echo "Will install $CUPY_PKG."
@@ -66,10 +85,11 @@ fi
 echo "Using conda frontend: $CONDA_CMD"
 
 # ── 4. Create / update the conda environment ──────────────────────────────────
-# We append a cuda-version pin to the environment spec so the solver
-# installs cuda-nvrtc / libcufft builds that match the driver exactly.
-# Without this, the solver may pick a newer CUDA toolkit than the driver
-# supports, causing PTX version errors at runtime.
+# CONDA_OVERRIDE_CUDA tells the solver which __cuda virtual package to
+# assume, so it picks the right openmm/openff/etc builds.
+# We do NOT add cuda-version as an explicit dependency — that causes
+# unsolvable environments when the driver's CUDA version is newer than
+# what conda-forge has built packages for.
 
 ENV_NAME=$(grep -E "^name:" environment.yaml | awk '{print $2}')
 if [ -z "$ENV_NAME" ]; then
@@ -77,21 +97,39 @@ if [ -z "$ENV_NAME" ]; then
 fi
 echo "Target environment: $ENV_NAME"
 
-# Build a temporary yaml with the cuda-version pin injected
-if [ -n "$CUDA_VER" ]; then
-    echo "  Pinning cuda-version=${CUDA_VER} to match driver"
-    # Append the pin as the last dependency
-    sed "/^  - pre-commit$/a\\  - cuda-version=${CUDA_VER}" environment.yaml > _env_pinned.yaml
-    ENV_FILE="_env_pinned.yaml"
-else
-    ENV_FILE="environment.yaml"
+# If using plain conda (not mamba/micromamba), enable the libmamba solver.
+# The classic solver is extremely slow and can OOM on complex environments.
+if [ "$CONDA_CMD" == "conda" ]; then
+    if conda config --show solver 2>/dev/null | grep -q "libmamba"; then
+        echo "  conda solver: libmamba (already configured)"
+    else
+        echo "  Enabling libmamba solver for faster environment resolution..."
+        conda install -n base -y conda-libmamba-solver 2>/dev/null || true
+        conda config --set solver libmamba 2>/dev/null || true
+    fi
+fi
+
+# Determine whether to create or update
+ENV_EXISTS=false
+if conda env list 2>/dev/null | grep -qE "^${ENV_NAME}\s"; then
+    ENV_EXISTS=true
+elif micromamba env list 2>/dev/null | grep -qE "${ENV_NAME}"; then
+    ENV_EXISTS=true
 fi
 
 echo "Creating/updating conda environment..."
-CONDA_OVERRIDE_CUDA="${CUDA_VER:-13.0}" $CONDA_CMD env update -f "$ENV_FILE" --prune
+if [ -n "$CONDA_CUDA_OVERRIDE" ]; then
+    echo "  CONDA_OVERRIDE_CUDA=$CONDA_CUDA_OVERRIDE"
+    export CONDA_OVERRIDE_CUDA="$CONDA_CUDA_OVERRIDE"
+fi
 
-# Clean up temp file
-[ -f _env_pinned.yaml ] && rm _env_pinned.yaml
+if [ "$ENV_EXISTS" == "true" ]; then
+    echo "  Environment exists — updating..."
+    $CONDA_CMD env update -f environment.yaml --prune
+else
+    echo "  Creating fresh environment..."
+    $CONDA_CMD env create -f environment.yaml
+fi
 
 # ── 5. Pip post-install (runs *inside* the conda env) ────────────────────────
 #
@@ -101,7 +139,7 @@ CONDA_OVERRIDE_CUDA="${CUDA_VER:-13.0}" $CONDA_CMD env update -f "$ENV_FILE" --p
 
 echo "Installing $CUPY_PKG, mpi4py, femto, getcontacts, and ultracontacts..."
 
-cat << EOF > post_install_tmp.sh
+cat <<EOF > post_install_tmp.sh
 #!/bin/bash
 set -e
 
