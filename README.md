@@ -51,20 +51,20 @@ mkdir ~/chacra_example && cd ~/chacra_example
 Setup the working directory.
 
 ```
-chacra-project --example
+chacra project --example
 ```
 The "--example" flag just copies the 1tnf.pdb into structures/. 
 
 Solvate the structure and create an [OpenMM](https://github.com/openmm) system to simulate with replica exchange.
 ```
-make-simulation -s structures/1tnf.pdb --fix --name 1tnf_example
+chacra make-simulation -s structures/1tnf.pdb --fix --name 1tnf_example
 ```
 The "--fix" flag will use OpenMM's pdbfixer to automatically protonate the structure and can insert missing residues if a .cif file is provided with the full sequence. Always check the output structure. Missing residues are placed naively and can make the termini extend out, creating a overly large simulation box. You'll see that a 1tnf_example_minimized.pdb is in the structures/ directory and 1tnf_example_system.xml is in the system/ directory.
 
 Now you can run Hamiltonian replica exchange molecular dynamics (HREMD) which by default will apply the Hamiltonian scaling to all the protein atoms. HREMD is implemented with [femto](https://github.com/Psivant/femto). femto will spread the systems out between the available GPUs on the node. Assuming a node with 4 GPUs and 20 replicas...
 
 ```
-run-hremd --system_file system/1tnf_example_system.xml \
+chacra run-hremd --system_file system/1tnf_example_system.xml \
           --structure_file structures/1tnf_example_minimized.pdb \
           --n_cycles 1000 \
           -j 4 \
@@ -76,7 +76,7 @@ This command will run 1000 replica exchange cycles with 1000 timesteps per cycle
 To continue running, just execute the above command again and a new run/ folder will be created in each of the directories. You'll find the extended run output there when the script exits.
 
 #### Output
-run-hremd also calls process-output to automatically generate the state trajectories, run the contact calculations, and write some ChACRA output. These outputs are found in state_trajectories/run_{i}, contact_output/run_{i}, and analysis_output/run_{i}. 
+`chacra run-hremd` also calls `chacra process-output` to automatically generate the state trajectories, run the contact calculations, and write some ChACRA output. These outputs are found in state_trajectories/run_{i}, contact_output/run_{i}, and analysis_output/run_{i}. If `process-output` fails partway through, you can rerun it directly — it will skip completed stages and resume from where it left off.
 
 A .pml file and a .csv is written to the analysis_output/run_{i} directory so you can visualize the chacras and know which contacts are most sensitive on each chacra. The total_contacts.pd pandas dataframe reflects the accumulated data for all the runs and the .pml and .csv file reflects all of the combined runs as well. You should keep running until these outputs converge. The .csv file provides the names of the most sensitive interactions on each chacra. The residues in the first couple contacts in each column can be good targets for structure-activity investigations.
 
