@@ -43,6 +43,13 @@ from chacra.trajectories.process_hremd import (
 )
 import GPUtil
 from chacra.plot import plot_chacras, plot_difference_of_roots, plot_explained_variance
+from chacra.convergence import (
+    convergence_report,
+    print_convergence_report,
+    save_convergence_report,
+    plot_convergence_history,
+    plot_exchange_diagnostics,
+)
 from chacra.visualize.pymol import to_pymol
 from chacra.utils import RunConfig
 
@@ -626,6 +633,39 @@ def main():
         pc_range=(cf.cpca.top_chacras[0], cf.cpca.top_chacras[-1]),
         variable_sphere_scale=True,
     )
+
+    # ---------------------------------------------------------------------- #
+    # Convergence diagnostics                                                 #
+    # ---------------------------------------------------------------------- #
+    # Load exchange probs for this run (saved in stage 2)
+    exch_path = f"./analysis_output/run_{run}/exchange_probabilities.npy"
+    exchange_probs = np.load(exch_path) if os.path.exists(exch_path) else None
+
+    k_convergence = len(cf.cpca.top_chacras) if cf.cpca.top_chacras else 3
+    report = convergence_report(
+        run=run,
+        n_states=n_states,
+        exchange_probs=exchange_probs,
+        k=k_convergence,
+        n_jobs=args.n_jobs,
+    )
+    save_convergence_report(report, f"./analysis_output/run_{run}")
+    print_convergence_report(report)
+
+    # Exchange diagnostics plot
+    if exchange_probs is not None:
+        fig = plot_exchange_diagnostics(
+            exchange_probs,
+            filename=f"./analysis_output/run_{run}/exchange_diagnostics.png",
+        )
+        fig.clf()
+
+    # Convergence history plot (across all runs)
+    fig = plot_convergence_history(
+        filename=f"./analysis_output/convergence_history.png",
+    )
+    if fig is not None:
+        fig.clf()
 
     # ---------------------------------------------------------------------- #
     # Finalize                                                                #
