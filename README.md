@@ -104,7 +104,12 @@ If you set up a system with a ligand, you may not be able to run femto HREMD wit
 #### Common Errors
 If you encounter particle NaN errors running HREMD, it's likely due to starting coordinates that aren't adequately energy minimized or equilibrated. 
 
-Another common error is related to CUDA driver version incompatibility with OpenMM dependencies. Check the analysis_output/run_x/ directory for hremd_stderr.log file for more information. The error log will show something like "CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222)". Refer to [OpenMM](https://github.com/openmm/openmm) docs and git issues. 
+Another common error is `CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222)`, which means the CUDA toolkit packages in the conda environment are newer than what your GPU driver supports. The `install.sh` script handles this automatically by setting `CONDA_OVERRIDE_CUDA` to match your driver. If you installed manually, recreate the environment with:
+```bash
+CONDA_OVERRIDE_CUDA=$(nvidia-smi | grep -Eo 'CUDA Version: [0-9]+\.[0-9]+' | grep -Eo '[0-9]+\.[0-9]+') \
+  conda env update -f environment.yaml --prune
+```
+
 
 #### Citations
 Please cite the following if you use ChACRA.

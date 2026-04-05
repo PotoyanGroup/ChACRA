@@ -27,27 +27,34 @@ if ! command -v nvidia-smi &> /dev/null; then
     exit 1
 fi
 
-# ── 2. Detect CUDA version and select CuPy wheel ─────────────────────────────
+# ── 2. Detect CUDA version from the driver ────────────────────────────────────
+# nvidia-smi reports the highest CUDA version the *driver* supports.
+# We pin cuda-version to this exact value so that the CUDA runtime
+# packages (cuda-nvrtc, libcufft, etc.) match the driver and we avoid
+# CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222).
 
 CUDA_VER=$(nvidia-smi | grep -Eo 'CUDA Version: [0-9]+\.[0-9]+' | grep -Eo '[0-9]+\.[0-9]+' | head -1)
 if [ -z "$CUDA_VER" ]; then
-    echo "Warning: Could not detect CUDA version from nvidia-smi. Defaulting to cupy-cuda12x."
+    echo "Warning: Could not detect CUDA version from nvidia-smi."
+    echo "         Conda will pick the default CUDA variant — this may cause PTX errors."
+    CUDA_MAJOR=""
+else
+    CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
+    echo "Detected driver CUDA version: $CUDA_VER (major=$CUDA_MAJOR)"
+fi
+
+# Select the correct CuPy wheel
+if [ "$CUDA_MAJOR" == "11" ]; then
+    CUPY_PKG="cupy-cuda11x"
+elif [ "$CUDA_MAJOR" == "12" ] || [ "$CUDA_MAJOR" == "13" ]; then
     CUPY_PKG="cupy-cuda12x"
 else
-    MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
-    if [ "$MAJOR" == "11" ]; then
-        CUPY_PKG="cupy-cuda11x"
-    elif [ "$MAJOR" == "12" ] || [ "$MAJOR" == "13" ]; then
-        CUPY_PKG="cupy-cuda12x"
-    else
-        echo "Warning: Unrecognized CUDA major version ($MAJOR). Defaulting to cupy-cuda12x."
-        CUPY_PKG="cupy-cuda12x"
-    fi
+    echo "Warning: Unrecognized or missing CUDA major version ($CUDA_MAJOR). Defaulting to cupy-cuda12x."
+    CUPY_PKG="cupy-cuda12x"
 fi
-echo "Detected CUDA Version: $CUDA_VER. Will install $CUPY_PKG."
+echo "Will install $CUPY_PKG."
 
 # ── 3. Pick the best available conda frontend ─────────────────────────────────
-# Prefer micromamba > mamba > conda (faster solve, same interface)
 
 if command -v micromamba &> /dev/null; then
     CONDA_CMD="micromamba"
@@ -59,6 +66,10 @@ fi
 echo "Using conda frontend: $CONDA_CMD"
 
 # ── 4. Create / update the conda environment ──────────────────────────────────
+# We append a cuda-version pin to the environment spec so the solver
+# installs cuda-nvrtc / libcufft builds that match the driver exactly.
+# Without this, the solver may pick a newer CUDA toolkit than the driver
+# supports, causing PTX version errors at runtime.
 
 ENV_NAME=$(grep -E "^name:" environment.yaml | awk '{print $2}')
 if [ -z "$ENV_NAME" ]; then
@@ -66,8 +77,21 @@ if [ -z "$ENV_NAME" ]; then
 fi
 echo "Target environment: $ENV_NAME"
 
-echo "Creating/updating conda environment from environment.yaml..."
-$CONDA_CMD env update -f environment.yaml --prune
+# Build a temporary yaml with the cuda-version pin injected
+if [ -n "$CUDA_VER" ]; then
+    echo "  Pinning cuda-version=${CUDA_VER} to match driver"
+    # Append the pin as the last dependency
+    sed "/^  - pre-commit$/a\\  - cuda-version=${CUDA_VER}" environment.yaml > _env_pinned.yaml
+    ENV_FILE="_env_pinned.yaml"
+else
+    ENV_FILE="environment.yaml"
+fi
+
+echo "Creating/updating conda environment..."
+CONDA_OVERRIDE_CUDA="${CUDA_VER:-13.0}" $CONDA_CMD env update -f "$ENV_FILE" --prune
+
+# Clean up temp file
+[ -f _env_pinned.yaml ] && rm _env_pinned.yaml
 
 # ── 5. Pip post-install (runs *inside* the conda env) ────────────────────────
 #
@@ -81,7 +105,7 @@ cat << EOF > post_install_tmp.sh
 #!/bin/bash
 set -e
 
-echo "Building mpi4py against system MPI (mpicc=$(which mpicc))"
+echo "Building mpi4py against system MPI (mpicc=\$(which mpicc))"
 
 pip install --no-cache-dir $CUPY_PKG
 pip install --no-cache-dir mpi4py
@@ -94,7 +118,7 @@ pip install --no-cache-dir --no-deps "git+https://github.com/Dan-Burns/getcontac
 pip install --no-cache-dir --no-deps "git+https://github.com/Dan-Burns/ultracontacts.git"
 
 # Install ChACRA itself in editable mode so local edits are reflected.
-pip install --no-cache-dir -e "$(pwd)"
+pip install --no-cache-dir -e "\$(pwd)"
 EOF
 
 chmod +x post_install_tmp.sh

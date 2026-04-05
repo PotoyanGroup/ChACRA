@@ -16,13 +16,14 @@ dependencies:
 
   # ── Core simulation ───────────────────────────────────────────────────────
   - openmm>=8.1
-  - openmmforcefields
+  - openmmforcefields>=0.15.1   # pulls openff-units>=0.3 → pint>=0.24 (numpy 2.x safe)
   - pdbfixer
 
   # ── femto dependencies (conda-only) ───────────────────────────────────────
   # femto itself is pip-installed in install.sh (Dan-Burns fork).
   - mdtop
   - pydantic-units
+  - tensorboardx               # runtime dep of femto (logging), not in its pyproject
 
   # ── Scientific stack ──────────────────────────────────────────────────────
   - numpy
@@ -33,6 +34,7 @@ dependencies:
   - networkx
   - pyarrow
   - sympy
+  - pymbar>=4
 
   - rdkit
   - mdtraj
