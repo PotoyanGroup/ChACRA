@@ -1,6 +1,21 @@
 """
-Process HREMD output: separate state trajectories, run getcontacts,
-accumulate contact-frequency data, and write analysis outputs.
+Process HREMD output: separate state trajectories, run contacts,
+compute frequencies, and produce ChACRA analysis.
+
+Pipeline stages
+───────────────
+1. State trajectories    → state_trajectories/run_N/state_*.xtc
+2. Exchange probabilities → analysis_output/run_N/exchange_probabilities.npy
+3. Contact calculations  → contact_output/run_N/contacts/cont_state_*.{parquet,tsv}
+4. Frequency calculation → contact_output/run_N/freqs/freqs_state_*.*
+5. ChACRA analysis       → analysis_output/run_N/ (plots, .pml, total_contacts)
+
+Stages 1–4 are skipped when their outputs already exist.  Once a
+stage is identified as incomplete every downstream stage re-runs
+even if its own outputs look complete (cascade rule).  Stage 5
+always re-runs to guarantee fresh results.
+
+Use ``--force`` to ignore all skip checks and rerun everything.
 
 Temps and replica count are read from ``chacra_run.json`` when available
 so that repeated restarts do not require re-supplying ``--min_temp``,
@@ -23,7 +38,6 @@ from chacra.trajectories.process_hremd import (
     load_femto_data,
     get_num_states,
     ReplicaHandler,
-    get_exchange_probabilities,
     get_exchange_probabilities,
     get_state_energies,
 )
@@ -52,11 +66,11 @@ def _update_latest_symlink(analysis_dir: str, run: int) -> None:
 
 
 def _sorted_contact_files(freq_dir: str) -> list[str]:
-    """Return conditionally sorted contact files (.parquet or .tsv) sorted by state index."""
+    """Return contact files (.parquet or .tsv) sorted by state index."""
     all_files = os.listdir(freq_dir)
     parquet_files = [f for f in all_files if f.endswith(".parquet")]
     target_files = parquet_files if parquet_files else [f for f in all_files if f.endswith(".tsv")]
-    
+
     return [
         f"{freq_dir}/{f}"
         for f in sorted(
@@ -64,6 +78,22 @@ def _sorted_contact_files(freq_dir: str) -> list[str]:
             key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0,
         )
     ]
+
+
+def _contact_exists(run: int, state_idx: int) -> bool:
+    """Check if a per-state contact file exists (parquet or tsv)."""
+    return (
+        os.path.exists(f"contact_output/run_{run}/contacts/cont_state_{state_idx}.parquet")
+        or os.path.exists(f"contact_output/run_{run}/contacts/cont_state_{state_idx}.tsv")
+    )
+
+
+def _freq_exists(run: int, state_idx: int) -> bool:
+    """Check if a per-state frequency file exists (parquet or tsv)."""
+    return (
+        os.path.exists(f"contact_output/run_{run}/freqs/freqs_state_{state_idx}_condensed.parquet")
+        or os.path.exists(f"contact_output/run_{run}/freqs/freqs_state_{state_idx}.tsv")
+    )
 
 
 def _accumulate_contacts(
@@ -84,12 +114,10 @@ def _accumulate_contacts(
             f"  [process-output] No prior parquet found at {prior_parquet}; "
             "falling back to unweighted direct merge."
         )
-        # Without tracking headers across all history, a flat fallback is safest.
-        # This only triggers if upgrading midway through an old project.
         return current_run_df
 
     prior_df = pd.read_parquet(prior_parquet)
-    
+
     # Recover frame counts via MDAnalysis (only needs 1 IO call per run)
     current_xtc = f"./state_trajectories/run_{run}/state_0.xtc"
     current_frames = len(mda.Universe(selection_file, current_xtc).trajectory) if os.path.exists(current_xtc) else 1
@@ -128,11 +156,18 @@ def main():
             "Process the HREMD output.  Replica trajectories are separated into "
             "individual thermodynamic-state trajectories (state_trajectories/run_N/), "
             "contacts are calculated (contact_output/run_N/), and cumulative analysis "
-            "outputs are written to analysis_output/run_N/."
+            "outputs are written to analysis_output/run_N/.  Stages with existing "
+            "outputs are skipped automatically; use --force to rerun everything."
         )
     )
     parser.add_argument(
         "--run", type=int, required=True, help="The run ID to process."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Force all stages to re-run, ignoring existing outputs.",
     )
     parser.add_argument(
         "--config",
@@ -152,6 +187,12 @@ def main():
         type=str,
         default=None,
         help="Path to the topology / structure file.",
+    )
+    parser.add_argument(
+        "--system_file",
+        type=str,
+        default=None,
+        help="Path to the OpenMM system XML (used for H-bond topology in ultracontacts).",
     )
     parser.add_argument(
         "--save_interval",
@@ -215,6 +256,8 @@ def main():
             "to chacra_run.json, or supply --min_temp, --max_temp, and --n_systems."
         )
 
+    n_states = len(temps)
+
     # ---------------------------------------------------------------------- #
     # Directory setup                                                         #
     # ---------------------------------------------------------------------- #
@@ -224,141 +267,304 @@ def main():
     os.makedirs(f"./contact_output/run_{run}/freqs", exist_ok=True)
 
     # ---------------------------------------------------------------------- #
-    # Save protein-only reference structure                                   #
+    # Protein-only reference structure                                        #
     # ---------------------------------------------------------------------- #
     structure_name = re.split(r"\/|\.", structure_file)[-2]
     selection_file = f"./structures/{structure_name}_protein.pdb"
     if not os.path.exists(selection_file):
-        protein = mda.Universe(structure_file).select_atoms("protein")
-        protein.write(selection_file)
+        u = mda.Universe(structure_file)
+        u.select_atoms(args.output_selection).write(selection_file)
 
     # ---------------------------------------------------------------------- #
-    # Load HREMD state data                                                   #
+    # Determine what needs to run — cascade rule                              #
     # ---------------------------------------------------------------------- #
-    hremd_data = f"./replica_trajectories/run_{run}/samples.arrow"
-    df = load_femto_data(hremd_data)
-    n_states = get_num_states(df)
+    # Once a stage is identified as incomplete, all downstream stages must
+    # re-run even if their outputs already exist.
+    cascade = args.force
 
-    # Write the protein-only selection file used as the contact topology
-    u = mda.Universe(structure_file)
-    u.select_atoms(args.output_selection).write(selection_file)
-
-    # ---------------------------------------------------------------------- #
-    # Energy plots                                                            #
-    # ---------------------------------------------------------------------- #
-    from chacra.plot import plot_energies
-    plot_energies(
-        get_state_energies(df),
-        filename=f"./analysis_output/run_{run}/state_energies.png",
-        n_bins=50,
+    # Stage 1 check: all state trajectory xtc files exist?
+    stage1_complete = all(
+        os.path.exists(f"./state_trajectories/run_{run}/state_{i}.xtc")
+        for i in range(n_states)
     )
+    run_stage1 = cascade or not stage1_complete
+    if run_stage1:
+        cascade = True
 
-    # ---------------------------------------------------------------------- #
-    # State trajectory assembly                                               #
-    # ---------------------------------------------------------------------- #
-    replica_handler = ReplicaHandler(
-        structure=structure_file,
-        traj_dir=f"./replica_trajectories/run_{run}/trajectories",
-        hremd_data=hremd_data,
-        save_interval=args.save_interval,
+    # Stage 2 check: exchange probabilities exist?
+    stage2_complete = os.path.exists(
+        f"./analysis_output/run_{run}/exchange_probabilities.npy"
     )
-    replica_handler.write_state_trajectories(
-        output_dir=f"./state_trajectories/run_{run}",
-        selection=args.output_selection,
-        ref=selection_file,
-    )
+    run_stage2 = cascade or not stage2_complete
+    if run_stage2:
+        cascade = True
+
+    # Stage 3 check: per-state contact files
+    missing_contacts = [
+        i for i in range(n_states)
+        if not _contact_exists(run, i)
+    ]
+    stage3_complete = len(missing_contacts) == 0
+    run_stage3 = cascade or not stage3_complete
+    if run_stage3 and not cascade:
+        # Stage 3 is the first incomplete stage — cascade starts here
+        cascade = True
+
+    # Stage 4 check: per-state frequency files
+    missing_freqs = [
+        i for i in range(n_states)
+        if not _freq_exists(run, i)
+    ]
+    stage4_complete = len(missing_freqs) == 0
+    run_stage4 = cascade or not stage4_complete
+    if run_stage4 and not cascade:
+        cascade = True
+
+    # Stage 5: always re-run
+    run_stage5 = True
 
     # ---------------------------------------------------------------------- #
-    # Exchange probabilities                                                  #
+    # Stage 1: State trajectory assembly                                      #
     # ---------------------------------------------------------------------- #
-    exchange_probs = get_exchange_probabilities(df)
-    np.save(f"./analysis_output/run_{run}/exchange_probabilities", exchange_probs)
-    with open(f"./analysis_output/run_{run}/exchange_probabilities.txt", "w") as f:
-        for i, prob in enumerate(exchange_probs):
-            f.write(f"{i}\n\t{prob:.4f}\n")
+    print(f"\n[process-output] Stage 1/5: State trajectories")
+    if run_stage1:
+        hremd_data = f"./replica_trajectories/run_{run}/samples.arrow"
+        if not os.path.exists(hremd_data):
+            sys.exit(f"  [ERROR] {hremd_data} not found. Cannot generate state trajectories.")
 
-    del replica_handler, df
+        df = load_femto_data(hremd_data)
+
+        # Energy plots (cheap, uses femto data)
+        from chacra.plot import plot_energies
+        plot_energies(
+            get_state_energies(df),
+            filename=f"./analysis_output/run_{run}/state_energies.png",
+            n_bins=50,
+        )
+
+        replica_handler = ReplicaHandler(
+            structure=structure_file,
+            traj_dir=f"./replica_trajectories/run_{run}/trajectories",
+            hremd_data=hremd_data,
+            save_interval=args.save_interval,
+        )
+        replica_handler.write_state_trajectories(
+            output_dir=f"./state_trajectories/run_{run}",
+            selection=args.output_selection,
+            ref=selection_file,
+        )
+        print(f"  [DONE] Wrote {n_states} state trajectories.")
+    else:
+        df = None  # not loaded — not needed
+        print(f"  [SKIP] All {n_states} state trajectories already exist.")
+
+    # ---------------------------------------------------------------------- #
+    # Stage 2: Exchange probabilities                                         #
+    # ---------------------------------------------------------------------- #
+    print(f"\n[process-output] Stage 2/5: Exchange probabilities")
+    if run_stage2:
+        # Load femto data if stage 1 was skipped
+        if df is None:
+            hremd_data = f"./replica_trajectories/run_{run}/samples.arrow"
+            if not os.path.exists(hremd_data):
+                sys.exit(f"  [ERROR] {hremd_data} not found. Cannot compute exchange probabilities.")
+            df = load_femto_data(hremd_data)
+
+        exchange_probs = get_exchange_probabilities(df)
+        np.save(f"./analysis_output/run_{run}/exchange_probabilities", exchange_probs)
+        with open(f"./analysis_output/run_{run}/exchange_probabilities.txt", "w") as f:
+            for i, prob in enumerate(exchange_probs):
+                f.write(f"{i}\n\t{prob:.4f}\n")
+        print(f"  [DONE] Exchange probabilities saved.")
+    else:
+        print(f"  [SKIP] Exchange probabilities already exist.")
+
+    # Free femto data — no longer needed after stage 2
+    if df is not None:
+        del df
+    if "replica_handler" in dir():
+        del replica_handler
     gc.collect()
 
     # ---------------------------------------------------------------------- #
+    # Stage 3: Contact calculations (per-state)                              #
     # ---------------------------------------------------------------------- #
-    # Contact calculations (ultracontacts -> fallback getcontacts)           #
-    # ---------------------------------------------------------------------- #
-    
+    print(f"\n[process-output] Stage 3/5: Contact calculations")
+
     gpus = GPUtil.getGPUs()
     n_gpus = len(gpus)
-    
-    # We fetch system xml config if it exists
-    openmm_sys = run_config.get("system_file") or args.system_file
+    use_ultracontacts = n_gpus > 0
+    openmm_sys = getattr(args, "system_file", None) or run_config.get("system_file")
 
-    if n_gpus > 0:
-        print(f"[process-output] Detected {n_gpus} GPUs. Running ultracontacts in parallel chunks...")
-        # Break states into chunks of size n_gpus
-        states = list(range(n_states))
-        chunks = [states[i:i + n_gpus] for i in range(0, len(states), n_gpus)]
-        
-        for chunk in chunks:
-            processes = []
-            for gpu_offset, state_idx in enumerate(chunk):
-                contacts_out = f"contact_output/run_{run}/contacts/cont_state_{state_idx}.parquet"
-                freqs_out = f"contact_output/run_{run}/freqs/freqs_state_{state_idx}_condensed.parquet"
-                
-                cmd = [
-                    "ultracontacts", "contacts",
-                    "--topology", selection_file,
-                    "--trajectory", f"./state_trajectories/run_{run}/state_{state_idx}.xtc",
-                    "--output", contacts_out,
-                    "--condensed", freqs_out,
-                    "--stride", "1",
-                ]
-                if openmm_sys and os.path.exists(openmm_sys):
-                    cmd.extend(["--openmm-system", str(openmm_sys)])
-                    
-                env = os.environ.copy()
-                env["CUDA_VISIBLE_DEVICES"] = str(gpu_offset)
-                
-                proc = subprocess.Popen(cmd, env=env)
-                processes.append(proc)
-            
-            # Wait for all states in this GPU batch to finish
-            for proc in processes:
-                proc.wait()
-                if proc.returncode != 0:
-                    print(f"[process-output] WARNING: An ultracontacts subprocess failed with return code {proc.returncode}.")
-                    
+    if run_stage3:
+        # Which states need contacts?
+        if cascade and stage3_complete and not args.force:
+            # Cascade from upstream — but contacts are all present.
+            # No upstream data changed if we didn't re-run stage 1,
+            # but cascade rule says rerun anyway for safety.
+            states_to_contact = list(range(n_states))
+        elif args.force:
+            states_to_contact = list(range(n_states))
+        else:
+            states_to_contact = missing_contacts
+
+        n_skip = n_states - len(states_to_contact)
+        if n_skip > 0:
+            print(f"  [SKIP] {n_skip}/{n_states} states already have contacts.")
+        print(f"  [RUN]  Computing contacts for {len(states_to_contact)} states.")
+
+        if use_ultracontacts:
+            print(f"  Engine: ultracontacts ({n_gpus} GPUs)")
+            # Process in GPU-sized chunks
+            chunks = [
+                states_to_contact[i:i + n_gpus]
+                for i in range(0, len(states_to_contact), n_gpus)
+            ]
+            for chunk in chunks:
+                processes = []
+                for gpu_offset, state_idx in enumerate(chunk):
+                    contacts_out = f"contact_output/run_{run}/contacts/cont_state_{state_idx}.parquet"
+                    cmd = [
+                        "ultracontacts", "contacts",
+                        "--topology", selection_file,
+                        "--trajectory", f"./state_trajectories/run_{run}/state_{state_idx}.xtc",
+                        "--output", contacts_out,
+                        "--stride", "1",
+                    ]
+                    if openmm_sys and os.path.exists(openmm_sys):
+                        cmd.extend(["--openmm-system", str(openmm_sys)])
+
+                    env = os.environ.copy()
+                    env["CUDA_VISIBLE_DEVICES"] = str(gpu_offset)
+
+                    proc = subprocess.Popen(cmd, env=env)
+                    processes.append((state_idx, proc))
+
+                for state_idx, proc in processes:
+                    proc.wait()
+                    if proc.returncode != 0:
+                        print(
+                            f"  [WARN] ultracontacts failed for state {state_idx} "
+                            f"(exit code {proc.returncode}). Continuing."
+                        )
+        else:
+            print(f"  Engine: getcontacts (CPU)")
+            for state_idx in states_to_contact:
+                contacts_out = f"contact_output/run_{run}/contacts/cont_state_{state_idx}.tsv"
+                try:
+                    subprocess.run(
+                        [
+                            "get-dynamic-contacts",
+                            "--topology", selection_file,
+                            "--trajectory", f"./state_trajectories/run_{run}/state_{state_idx}.xtc",
+                            "--output", str(contacts_out),
+                            "--cores", str(args.n_jobs),
+                            "--itypes", "all",
+                            "--distout",
+                            "--sele", "protein",
+                            "--sele2", "protein",
+                        ],
+                        check=True,
+                    )
+                except subprocess.CalledProcessError as e:
+                    print(
+                        f"  [WARN] getcontacts failed for state {state_idx} "
+                        f"(exit code {e.returncode}). Continuing."
+                    )
+        print(f"  [DONE] Contact calculations complete.")
     else:
-        print("[process-output] No GPUs detected. Falling back to getcontacts (CPU).")
-        for i in range(n_states):
-            contacts_out = f"contact_output/run_{run}/contacts/cont_state_{i}.tsv"
-            freqs_out = f"contact_output/run_{run}/freqs/freqs_state_{i}.tsv"
-
-            subprocess.run(
-                [
-                    "get-dynamic-contacts",
-                    "--topology", selection_file,
-                    "--trajectory", f"./state_trajectories/run_{run}/state_{i}.xtc",
-                    "--output", str(contacts_out),
-                    "--cores", str(args.n_jobs),
-                    "--itypes", "all",
-                    "--distout",
-                    "--sele", "protein",
-                    "--sele2", "protein",
-                ],
-                check=True,
-            )
-
-            subprocess.run(
-                [
-                    "get-contact-frequencies",
-                    "--input_files", str(contacts_out),
-                    "--output_file", str(freqs_out),
-                ],
-                check=True,
-            )
+        print(f"  [SKIP] All {n_states} states already have contacts.")
 
     # ---------------------------------------------------------------------- #
-    # Contact frequency accumulation                                          #
+    # Stage 4: Frequency calculation (per-state)                             #
     # ---------------------------------------------------------------------- #
+    print(f"\n[process-output] Stage 4/5: Frequency calculation")
+
+    if run_stage4:
+        # Which states need frequencies?
+        if cascade and stage4_complete and not args.force:
+            states_to_freq = list(range(n_states))
+        elif args.force:
+            states_to_freq = list(range(n_states))
+        else:
+            states_to_freq = missing_freqs
+
+        n_skip = n_states - len(states_to_freq)
+        if n_skip > 0:
+            print(f"  [SKIP] {n_skip}/{n_states} states already have frequencies.")
+        print(f"  [RUN]  Computing frequencies for {len(states_to_freq)} states.")
+
+        freq_failures = []
+        for state_idx in states_to_freq:
+            # Determine which contact file exists for this state
+            contact_parquet = f"contact_output/run_{run}/contacts/cont_state_{state_idx}.parquet"
+            contact_tsv = f"contact_output/run_{run}/contacts/cont_state_{state_idx}.tsv"
+
+            if os.path.exists(contact_parquet):
+                # ultracontacts frequencies (CPU — no GPU needed)
+                freq_out = f"contact_output/run_{run}/freqs/freqs_state_{state_idx}_condensed.parquet"
+                try:
+                    subprocess.run(
+                        [
+                            "ultracontacts", "frequencies",
+                            "--input", contact_parquet,
+                            "--output", freq_out,
+                            "--condensed",
+                        ],
+                        check=True,
+                    )
+                except subprocess.CalledProcessError as e:
+                    print(
+                        f"  [WARN] ultracontacts frequencies failed for state {state_idx} "
+                        f"(exit code {e.returncode}). Continuing."
+                    )
+                    freq_failures.append(state_idx)
+
+            elif os.path.exists(contact_tsv):
+                # getcontacts frequency calculation
+                freq_out = f"contact_output/run_{run}/freqs/freqs_state_{state_idx}.tsv"
+                try:
+                    subprocess.run(
+                        [
+                            "get-contact-frequencies",
+                            "--input_files", str(contact_tsv),
+                            "--output_file", str(freq_out),
+                        ],
+                        check=True,
+                    )
+                except subprocess.CalledProcessError as e:
+                    print(
+                        f"  [WARN] get-contact-frequencies failed for state {state_idx} "
+                        f"(exit code {e.returncode}). Continuing."
+                    )
+                    freq_failures.append(state_idx)
+            else:
+                print(
+                    f"  [WARN] No contact file found for state {state_idx}. "
+                    f"Cannot compute frequencies."
+                )
+                freq_failures.append(state_idx)
+
+        if freq_failures:
+            print(f"  [WARN] Frequency calculation failed for states: {freq_failures}")
+        print(f"  [DONE] Frequency calculation complete.")
+    else:
+        print(f"  [SKIP] All {n_states} states already have frequencies.")
+
+    # ---------------------------------------------------------------------- #
+    # Stage 5: Contact frequency aggregation + ChACRA analysis               #
+    # ---------------------------------------------------------------------- #
+    print(f"\n[process-output] Stage 5/5: ChACRA analysis")
+
+    # Hard-fail if any frequency files are missing
+    still_missing = [i for i in range(n_states) if not _freq_exists(run, i)]
+    if still_missing:
+        sys.exit(
+            f"  [ERROR] Cannot proceed with analysis — frequency files missing "
+            f"for states: {still_missing}.\n"
+            f"  Fix the upstream issue and rerun: process-output --run {run}"
+        )
+
     current_freq_dir = f"./contact_output/run_{run}/freqs"
     current_files = _sorted_contact_files(current_freq_dir)
     current_run_df = make_contact_dataframe(current_files)
@@ -373,12 +579,9 @@ def main():
     del current_run_df
     gc.collect()
 
-    # Persist the cumulative result — parquet is portable across pandas versions
+    # Persist the cumulative result
     cdf.to_parquet(f"./analysis_output/run_{run}/total_contacts.parquet", index=True)
 
-    # ---------------------------------------------------------------------- #
-    # ChACRA analysis                                                         #
-    # ---------------------------------------------------------------------- #
     cf = ContactFrequencies(cdf, temps=np.round(temps), n_jobs=args.n_jobs)
 
     top_ten = {
@@ -425,10 +628,14 @@ def main():
     )
 
     # ---------------------------------------------------------------------- #
-    # Update analysis_output/latest symlink                                  #
+    # Finalize                                                                #
     # ---------------------------------------------------------------------- #
     _update_latest_symlink("./analysis_output", run)
-    print(f"[process-output] Done.  See analysis_output/run_{run}/ (or analysis_output/latest/).")
+
+    # Persist config
+    run_config.write()
+
+    print(f"\n[process-output] Done.  See analysis_output/run_{run}/ (or analysis_output/latest/).")
 
 
 if __name__ == "__main__":

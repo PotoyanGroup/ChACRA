@@ -250,7 +250,7 @@ def main():
     # Build run-femto args (run-femto always runs inside MPI now)         #
     # ------------------------------------------------------------------ #
     femto_args = [
-        "run-femto",
+        "chacra", "run-femto",
         "--system_file",   args.system_file,
         "--structure_file", args.structure_file,
         "--n_cycles",      str(total_cycles),
@@ -364,7 +364,7 @@ def main():
         # Process the replicas to state trajectories and run analyses.
         # Pass --config so process-output reads temps/n_systems from JSON.
         analysis_command = [
-            "process-output",
+            "chacra", "process-output",
             "--run",
             str(current_run),
             "--n_jobs",
