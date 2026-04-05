@@ -714,6 +714,13 @@ class ContactPCA:
         structure:str|os.PathLike|None=None,
     ):
         # TODO allow for ContactFrequencies input
+        if contact_df.empty or contact_df.shape[1] == 0:
+            raise ValueError(
+                "Contact dataframe is empty — PCA cannot proceed. "
+                "This usually means the upstream contact calculation failed "
+                "(e.g. missing the 'polars' package for ultracontacts). "
+                "Check the contact calculation logs for errors."
+            )
         pca = PCA()
         print("Opening the chacras.")
         self.pca = pca.fit(contact_df)
