@@ -85,11 +85,22 @@ fi
 echo "Using conda frontend: $CONDA_CMD"
 
 # ── 4. Create / update the conda environment ──────────────────────────────────
-# CONDA_OVERRIDE_CUDA tells the solver which __cuda virtual package to
-# assume, so it picks the right openmm/openff/etc builds.
-# We do NOT add cuda-version as an explicit dependency — that causes
-# unsolvable environments when the driver's CUDA version is newer than
-# what conda-forge has built packages for.
+#
+# The environment has many CUDA-aware packages (openmm, openmmforcefields,
+# vmd-python, rdkit, mdanalysis, mdtraj) that must all resolve to mutually
+# compatible builds.  Solving everything at once creates a huge constraint
+# graph that can take 30+ minutes even with libmamba/micromamba.
+#
+# Strategy: two-pass install.
+#   Pass 1 — install only the CUDA-coupled kernel (openmm, openmmforcefields,
+#             vmd-python, pdbfixer).  This locks in the CUDA ABI and Python
+#             version, giving the solver a tiny constraint space.
+#   Pass 2 — install the full environment.  The solver now has openmm's
+#             CUDA build as a fixed point and the remaining search space is
+#             far smaller.
+#
+# CONDA_OVERRIDE_CUDA is exported for both passes so the solver selects
+# the right CUDA build variant.
 
 ENV_NAME=$(grep -E "^name:" environment.yaml | awk '{print $2}')
 if [ -z "$ENV_NAME" ]; then
@@ -98,7 +109,6 @@ fi
 echo "Target environment: $ENV_NAME"
 
 # If using plain conda (not mamba/micromamba), enable the libmamba solver.
-# The classic solver is extremely slow and can OOM on complex environments.
 if [ "$CONDA_CMD" == "conda" ]; then
     if conda config --show solver 2>/dev/null | grep -q "libmamba"; then
         echo "  conda solver: libmamba (already configured)"
@@ -109,26 +119,38 @@ if [ "$CONDA_CMD" == "conda" ]; then
     fi
 fi
 
-# Determine whether to create or update
-ENV_EXISTS=false
-if conda env list 2>/dev/null | grep -qE "^${ENV_NAME}\s"; then
-    ENV_EXISTS=true
-elif micromamba env list 2>/dev/null | grep -qE "${ENV_NAME}"; then
-    ENV_EXISTS=true
-fi
-
-echo "Creating/updating conda environment..."
 if [ -n "$CONDA_CUDA_OVERRIDE" ]; then
     echo "  CONDA_OVERRIDE_CUDA=$CONDA_CUDA_OVERRIDE"
     export CONDA_OVERRIDE_CUDA="$CONDA_CUDA_OVERRIDE"
 fi
 
+# Determine whether the environment already exists
+ENV_EXISTS=false
+if $CONDA_CMD env list 2>/dev/null | grep -qE "^${ENV_NAME}[[:space:]]"; then
+    ENV_EXISTS=true
+fi
+
 if [ "$ENV_EXISTS" == "true" ]; then
-    echo "  Environment exists — updating..."
+    #── Update path: single pass is fine for incremental updates ──────────────
+    echo "  Environment exists — updating (single pass)..."
     $CONDA_CMD env update -f environment.yaml --prune
 else
-    echo "  Creating fresh environment..."
-    $CONDA_CMD env create -f environment.yaml
+    # ── Fresh install: two-pass strategy ──────────────────────────────────────
+    CHANNELS="-c conda-forge"
+    PYTHON_VER="python>=3.10,<3.13"
+
+    echo ""
+    echo "  Pass 1/2: Installing CUDA kernel (openmm + openmmforcefields + vmd-python)..."
+    $CONDA_CMD create -n "$ENV_NAME" -y $CHANNELS \
+        "$PYTHON_VER" \
+        "openmm>=8.1" \
+        "openmmforcefields>=0.15.1" \
+        "vmd-python" \
+        "pdbfixer"
+
+    echo ""
+    echo "  Pass 2/2: Installing full environment on top of CUDA kernel..."
+    $CONDA_CMD env update -n "$ENV_NAME" -f environment.yaml
 fi
 
 # ── 5. Pip post-install (runs *inside* the conda env) ────────────────────────
