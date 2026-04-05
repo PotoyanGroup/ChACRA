@@ -18,7 +18,7 @@ def get_contact_data(
     contactPCA,
     slope_range=(0, 7),
     pc_range=(1, 4),
-    variable_sphere_scale=False,
+    variable_sphere_scale=True,
     sphere_scale_range=(0.6, 1.5),
 ):
     """
@@ -242,7 +242,7 @@ def to_pymol(
     output_file="output.pml",
     slope_range=(0, 7),
     pc_range=(1, 4),
-    variable_sphere_scale=False,
+    variable_sphere_scale=True,
     sphere_scale_range=(0.6, 1.5),
     group=True,
 ):
