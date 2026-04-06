@@ -134,7 +134,7 @@ def main():
     parser.add_argument(
         "-o","--oversubscribe",
         type=int,
-        default=1,
+        default=None,
         help="The number of replicas to run simultaneously on each GPU. "
              "Default is 1 meaning that if you have 2 GPUs and 4 replicas, "
              "2 replicas will be assigned to each GPU with each one running sequentially. "
@@ -173,6 +173,7 @@ def main():
         "lambda_selection": "protein",
         "output_selection": "protein",
         "timestep": 2,
+        "oversubscribe": 1,
     }
     for key, val in _hard_defaults.items():
         if getattr(args, key, None) is None:
@@ -310,6 +311,7 @@ def main():
         output_selection=args.output_selection,
         timestep=args.timestep,
         n_jobs=args.n_jobs,
+        oversubscribe=args.oversubscribe,
         current_run=current_run,
     )
     run_config.write(_CONFIG_PATH)
