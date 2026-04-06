@@ -131,26 +131,71 @@ if $CONDA_CMD env list 2>/dev/null | grep -qE "^${ENV_NAME}[[:space:]]"; then
 fi
 
 if [ "$ENV_EXISTS" == "true" ]; then
-    #── Update path: single pass is fine for incremental updates ──────────────
-    echo "  Environment exists — updating (single pass)..."
-    $CONDA_CMD env update -f environment.yaml --prune
+    # ── Update path ────────────────────────────────────────────────────────────
+    # For incremental updates we still need env update, but without --prune
+    # to avoid re-solving the full removal set.  If you need --prune (to
+    # remove deleted packages), run: micromamba env update -f environment.yaml --prune
+    echo "  Environment exists — updating..."
+    $CONDA_CMD env update -n "$ENV_NAME" -f environment.yaml
 else
-    # ── Fresh install: two-pass strategy ──────────────────────────────────────
-    CHANNELS="-c conda-forge"
-    PYTHON_VER="python>=3.10,<3.13"
+    # ── Fresh install: sequential small-group strategy ─────────────────────────
+    # env update / env create with 30+ CUDA-aware packages simultaneously
+    # can exhaust RAM on the solver even with micromamba/libmamba.
+    # Installing in small groups keeps each solve's peak memory low.
+    # Groups are ordered so heavier constraints are anchored early.
 
+    C="-c conda-forge -n $ENV_NAME -y"
+
+    # Group 1: Python + CUDA kernel — locks in CUDA ABI and Python version
     echo ""
-    echo "  Pass 1/2: Installing CUDA kernel (openmm + openmmforcefields + vmd-python)..."
-    $CONDA_CMD create -n "$ENV_NAME" -y $CHANNELS \
-        "$PYTHON_VER" \
+    echo "  Group 1/6: Python + OpenMM CUDA kernel..."
+    $CONDA_CMD create -n "$ENV_NAME" -y -c conda-forge \
+        "python>=3.10,<3.13" \
         "openmm>=8.1" \
         "openmmforcefields>=0.15.1" \
         "vmd-python" \
         "pdbfixer"
 
-    echo ""
-    echo "  Pass 2/2: Installing full environment on top of CUDA kernel..."
-    $CONDA_CMD env update -n "$ENV_NAME" -f environment.yaml
+    # Group 2: Bio/MD packages (some CUDA-aware, anchors on openmm's Python)
+    echo "  Group 2/6: MD packages (rdkit, mdanalysis, mdtraj)..."
+    $CONDA_CMD install $C \
+        "rdkit" \
+        "mdanalysis>=2.9.0" \
+        "mdtraj"
+
+    # Group 3: femto conda-only deps
+    echo "  Group 3/6: femto dependencies..."
+    $CONDA_CMD install $C \
+        "mdtop" \
+        "pydantic-units" \
+        "tensorboardx" \
+        "pymbar>=4"
+
+    # Group 4: Core scientific stack
+    echo "  Group 4/6: Scientific stack..."
+    $CONDA_CMD install $C \
+        "numpy" \
+        "scipy" \
+        "pandas" \
+        "matplotlib" \
+        "scikit-learn" \
+        "networkx" \
+        "polars" \
+        "pyarrow" \
+        "sympy"
+
+    # Group 5: Utilities (all pure-Python or very lightweight)
+    echo "  Group 5/6: Utilities..."
+    $CONDA_CMD install $C \
+        "pydantic>=2" \
+        "click" \
+        "cloup" \
+        "tqdm" \
+        "pyyaml" \
+        "omegaconf" \
+        "gputil" \
+        "nglview" \
+        "pre-commit"
 fi
 
 # ── 5. Pip post-install (runs *inside* the conda env) ────────────────────────
