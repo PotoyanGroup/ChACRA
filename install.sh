@@ -2,14 +2,26 @@
 # ============================================================================
 # ChACRA Installation Script
 #
-# Primary path: install from a pre-solved conda lock file (fast, no solving).
-# Fallback path: sequential group install if no lock file exists (slower,
-#                but works without a pre-generated lock file).
+# Usage:
+#   bash install.sh               # fresh install or update existing env
+#   bash install.sh --reinstall   # remove existing env and reinstall from scratch
 #
-# To generate lock files for your CUDA version on a high-RAM machine:
+# Fast path (no solving): uses conda/explicit-cuda{12,13}.txt if present.
+# Fallback: sequential group solves (slower, for machines without spec files).
+#
+# To regenerate spec files after updating environment.yaml:
 #   bash tools/generate_locks.sh
 # ============================================================================
 set -e
+
+# ── 0. Parse flags ────────────────────────────────────────────────────────────
+REINSTALL=false
+for arg in "$@"; do
+    case $arg in
+        --reinstall) REINSTALL=true ;;
+        *) echo "Unknown argument: $arg"; exit 1 ;;
+    esac
+done
 
 echo "=== ChACRA Automated Installation ==="
 
@@ -79,10 +91,18 @@ if $CONDA_CMD env list 2>/dev/null | grep -qE "^${ENV_NAME}[[:space:]]"; then
     ENV_EXISTS=true
 fi
 
+if [ "$ENV_EXISTS" == "true" ] && [ "$REINSTALL" == "true" ]; then
+    echo ""
+    echo "--reinstall: removing existing '$ENV_NAME' environment..."
+    $CONDA_CMD env remove -n "$ENV_NAME" -y
+    ENV_EXISTS=false
+fi
+
 if [ "$ENV_EXISTS" == "true" ]; then
     # ── Existing env: just update ──────────────────────────────────────────────
     echo ""
-    echo "Environment already exists — updating..."
+    echo "Environment '$ENV_NAME' already exists — updating from environment.yaml..."
+    echo "(To do a clean reinstall from the fast explicit spec, use: bash install.sh --reinstall)"
     $CONDA_CMD env update -n "$ENV_NAME" -f conda/environment.yaml
 
 else
