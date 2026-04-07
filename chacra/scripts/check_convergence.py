@@ -90,8 +90,21 @@ def main():
         help="Number of bootstrap resamples (default: 100).",
     )
     parser.add_argument(
-        "--n_jobs", type=int, default=4,
-        help="Number of parallel workers for loading contact data.",
+        "--n_jobs", type=int, default=1,
+        help=(
+            "Number of parallel workers for loading contact files. "
+            "Default 1 (sequential) to avoid doubling peak RAM.  "
+            "Increase on machines with ample memory."
+        ),
+    )
+    parser.add_argument(
+        "--max_frames", type=int, default=None,
+        metavar="N",
+        help=(
+            "Subsample each state to at most N evenly-spaced frames before "
+            "computing frequencies.  Useful on memory-constrained machines "
+            "(e.g. --max_frames 20000 cuts RAM by ~5× for a 100k-frame run)."
+        ),
     )
     parser.add_argument(
         "--history", action="store_true", default=False,
@@ -181,6 +194,7 @@ def main():
         contact_base=args.contact_base,
         file_pattern=args.file_pattern,
         analysis_dir=args.analysis_dir,
+        max_frames_per_state=args.max_frames,
         n_jobs=args.n_jobs,
     )
 

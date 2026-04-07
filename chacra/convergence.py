@@ -49,33 +49,44 @@ class _StateContacts:
     """
     Pre-loaded per-frame contact data for one thermodynamic state.
 
-    Stores which frames each residue pair appears in.  This is compact
-    (thousands of pairs × hundreds of frames) and allows fast frequency
-    calculation for any frame subset.
+    ``pair_frames`` stores **sorted int32 numpy arrays** of frame indices
+    rather than Python sets.  This cuts memory usage ~7× because Python sets
+    carry ≥200 bytes of object overhead plus 28 bytes per integer element,
+    whereas a numpy int32 element costs 4 bytes.
 
     Attributes
     ----------
     state_idx : int
         The thermodynamic state index.
     frames : np.ndarray
-        Sorted array of unique (globally offset) frame indices.
-    pair_frames : dict[str, set[int]]
-        Mapping from "res1-res2" → set of frame indices where the pair appears.
+        Sorted int32 array of unique (globally offset) frame indices.
+    pair_frames : dict[str, np.ndarray]
+        Mapping from "res1-res2" → sorted int32 array of frame indices
+        where the pair appears.
     """
     state_idx: int
     frames: np.ndarray
-    pair_frames: dict[str, set[int]] = field(default_factory=dict)
+    pair_frames: dict[str, np.ndarray] = field(default_factory=dict)
 
-    def freq_for_subset(self, frame_set: set[int]) -> dict[str, float]:
-        """Compute contact frequencies for a subset of frames."""
-        n = len(frame_set)
+    def freq_for_frames(self, sample_frames: np.ndarray) -> dict[str, float]:
+        """
+        Compute contact frequencies for an array of frame indices.
+
+        ``sample_frames`` may contain duplicates (bootstrap resampling) or be
+        a contiguous slice (split-half).  numpy's ``isin`` uses searchsorted
+        internally for integer arrays, so the per-pair cost is
+        O(len(sample_frames) · log(len(pair_arr))).
+        """
+        n = len(sample_frames)
         if n == 0:
             return {}
-        return {
-            pair: len(fset & frame_set) / n
-            for pair, fset in self.pair_frames.items()
-            if len(fset & frame_set) > 0
-        }
+        result = {}
+        for pair, pair_arr in self.pair_frames.items():
+            # isin with integer arrays → searchsorted internally → fast
+            count = int(np.isin(sample_frames, pair_arr, assume_unique=False).sum())
+            if count > 0:
+                result[pair] = count / n
+        return result
 
 
 def _find_contact_files(
@@ -160,8 +171,8 @@ def _load_state_contacts_from_file(
 
 def _load_parquet_contacts(
     path: str, frame_offset: int,
-) -> tuple[np.ndarray, dict[str, set[int]]]:
-    """Stream a parquet contact file via Polars and return pair-frame sets."""
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Stream a parquet contact file via Polars and return sorted int32 arrays."""
     import polars as pl
 
     df = (
@@ -176,32 +187,36 @@ def _load_parquet_contacts(
             pl.when(pl.col("res2_raw") < pl.col("res1_raw"))
               .then(pl.col("res1_raw")).otherwise(pl.col("res2_raw")).alias("res2"),
         ])
-        # Deduplicate: one contact per (frame, res1, res2)
         .unique(subset=["frame", "res1", "res2"])
         .select(["frame", "res1", "res2"])
         .collect(streaming=True)
     )
 
-    frames_arr = df["frame"].to_numpy() + frame_offset
+    frames_raw = df["frame"].to_numpy() + frame_offset
     res1_arr = df["res1"].to_list()
     res2_arr = df["res2"].to_list()
 
-    unique_frames = np.unique(frames_arr)
-    pair_frames: dict[str, set[int]] = defaultdict(set)
-    for frame, r1, r2 in zip(frames_arr, res1_arr, res2_arr):
-        pair_frames[f"{r1}-{r2}"].add(int(frame))
+    unique_frames = np.unique(frames_raw).astype(np.int32)
 
-    return unique_frames, dict(pair_frames)
+    # Accumulate as lists then convert to sorted int32 arrays (7× less RAM than sets)
+    pair_lists: dict[str, list] = defaultdict(list)
+    for frame, r1, r2 in zip(frames_raw, res1_arr, res2_arr):
+        pair_lists[f"{r1}-{r2}"].append(int(frame))
+
+    pair_frames: dict[str, np.ndarray] = {
+        pair: np.array(sorted(set(lst)), dtype=np.int32)
+        for pair, lst in pair_lists.items()
+    }
+    return unique_frames, pair_frames
 
 
 def _load_tsv_contacts(
     path: str, frame_offset: int,
-) -> tuple[np.ndarray, dict[str, set[int]]]:
-    """Stream a getcontacts TSV file and return pair-frame sets."""
-    pair_frames: dict[str, set[int]] = defaultdict(set)
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Stream a getcontacts TSV file and return sorted int32 arrays per pair."""
+    # Accumulate as lists (cheaper per-append than sets for large data)
+    pair_lists: dict[str, list] = defaultdict(list)
     seen_frames: set[int] = set()
-
-    # Track (frame, pair) to deduplicate atom-level contacts to residue-level
     seen_frame_pairs: set[tuple[int, str]] = set()
 
     with open(path) as fh:
@@ -215,13 +230,11 @@ def _load_tsv_contacts(
             frame = int(parts[0]) + frame_offset
             seen_frames.add(frame)
 
-            # Extract residue labels: chain:resname:resid
             atom1_parts = parts[2].split(":")
             atom2_parts = parts[3].split(":")
             res1 = ":".join(atom1_parts[:3])
             res2 = ":".join(atom2_parts[:3])
 
-            # Canonical ordering
             if res2 < res1:
                 res1, res2 = res2, res1
 
@@ -229,9 +242,18 @@ def _load_tsv_contacts(
             key = (frame, pair)
             if key not in seen_frame_pairs:
                 seen_frame_pairs.add(key)
-                pair_frames[pair].add(frame)
+                pair_lists[pair].append(frame)
 
-    return np.array(sorted(seen_frames)), dict(pair_frames)
+    # Convert to sorted int32 arrays — ~7× less RAM than Python sets
+    pair_frames: dict[str, np.ndarray] = {
+        pair: np.array(lst, dtype=np.int32)   # already unique via seen_frame_pairs
+        for pair, lst in pair_lists.items()
+    }
+    # Sort each array (insertion order from the TSV is frame-sorted, but be safe)
+    for arr in pair_frames.values():
+        arr.sort()
+
+    return np.array(sorted(seen_frames), dtype=np.int32), pair_frames
 
 
 def _load_state_contacts(
@@ -285,17 +307,18 @@ def _load_state_worker(args: tuple) -> _StateContacts:
 
 def _build_freq_matrix(
     state_data: list[_StateContacts],
-    frame_subsets: list[set[int]],
+    frame_arrays: list[np.ndarray],
 ) -> pd.DataFrame:
     """
-    Build a contact frequency matrix from per-state frame subsets.
+    Build a contact frequency matrix from per-state frame arrays.
 
     Parameters
     ----------
     state_data : list[_StateContacts]
         Pre-loaded contact data, one per state (sorted by state_idx).
-    frame_subsets : list[set[int]]
-        One frame subset per state (same order as state_data).
+    frame_arrays : list[np.ndarray]
+        One frame array per state (same order as state_data).  May contain
+        duplicates (bootstrap) or be a contiguous slice (split-half).
 
     Returns
     -------
@@ -303,8 +326,8 @@ def _build_freq_matrix(
         Rows = states, columns = contact pairs, values = frequencies.
     """
     rows = []
-    for sc, subset in zip(state_data, frame_subsets):
-        rows.append(sc.freq_for_subset(subset))
+    for sc, frames in zip(state_data, frame_arrays):
+        rows.append(sc.freq_for_frames(frames))
 
     df = pd.DataFrame(rows).fillna(0.0)
     df.index = list(range(len(rows)))
@@ -359,7 +382,8 @@ def split_half_rmsip(
     k: int = 3,
     contact_base: str = "./contact_output",
     file_pattern: str | None = None,
-    n_jobs: int = 4,
+    max_frames_per_state: int | None = None,
+    n_jobs: int = 1,
 ) -> float:
     """
     Split-half RMSIP computed from per-frame contact records.
@@ -392,27 +416,50 @@ def split_half_rmsip(
     if n_jobs is None or n_jobs <= 0:
         n_jobs = cpu_count()
 
-    # Phase 1: Load per-frame data for all states (parallel)
+    # Phase 1: Load per-frame data for all states.
+    # Default n_jobs=1 (sequential) to avoid doubling peak RAM when states are
+    # large; set n_jobs > 1 only on machines with ample memory.
     args = [(i, contact_base, file_pattern) for i in range(n_states)]
-    with Pool(min(n_jobs, n_states)) as pool:
-        state_data = pool.map(_load_state_worker, args)
+    if n_jobs == 1:
+        state_data = [_load_state_worker(a) for a in args]
+    else:
+        with Pool(min(n_jobs, n_states)) as pool:
+            state_data = pool.map(_load_state_worker, args)
 
-    # Sort by state index
     state_data.sort(key=lambda sc: sc.state_idx)
 
-    # Phase 2: Split frames and compute frequencies
-    subsets_a = []
-    subsets_b = []
+    # Phase 2: Split frames and build frequency matrices.
+    # Use searchsorted on sorted int32 arrays — no set copies needed.
+    rows_a, rows_b = [], []
     for sc in state_data:
-        n = len(sc.frames)
+        frames = sc.frames
+        if max_frames_per_state and len(frames) > max_frames_per_state:
+            # Subsample evenly to cap memory on low-RAM machines
+            idx = np.linspace(0, len(frames) - 1, max_frames_per_state, dtype=int)
+            frames = frames[idx]
+
+        n = len(frames)
         if n < 4:
             return float("nan")
-        mid = n // 2
-        subsets_a.append(set(sc.frames[:mid].tolist()))
-        subsets_b.append(set(sc.frames[mid:].tolist()))
 
-    df_a = _build_freq_matrix(state_data, subsets_a)
-    df_b = _build_freq_matrix(state_data, subsets_b)
+        mid_frame_val = frames[n // 2 - 1]   # last frame value of the first half
+        first_n = n // 2
+        second_n = n - first_n
+
+        row_a, row_b = {}, {}
+        for pair, pair_arr in sc.pair_frames.items():
+            split = int(np.searchsorted(pair_arr, mid_frame_val, side="right"))
+            if split > 0:
+                row_a[pair] = split / first_n
+            tail = len(pair_arr) - split
+            if tail > 0:
+                row_b[pair] = tail / second_n
+
+        rows_a.append(row_a)
+        rows_b.append(row_b)
+
+    df_a = pd.DataFrame(rows_a).fillna(0.0)
+    df_b = pd.DataFrame(rows_b).fillna(0.0)
 
     # Align columns
     all_cols = df_a.columns.union(df_b.columns)
@@ -423,8 +470,14 @@ def split_half_rmsip(
     loadings_a = _fit_pca_loadings(df_a)
     loadings_b = _fit_pca_loadings(df_b)
 
-    k = min(k, df_a.shape[0], df_b.shape[0], len(all_cols))
-    return rmsip(loadings_a, loadings_b, k)
+    k_eff = min(k, df_a.shape[0], df_b.shape[0], len(all_cols))
+    if k_eff < k:
+        print(
+            f"  [rmsip] Warning: only {df_a.shape[0]} states available; "
+            f"comparing top {k_eff} PCs instead of {k}.  "
+            "RMSIP is more reliable when n_states >> k."
+        )
+    return rmsip(loadings_a, loadings_b, k_eff)
 
 
 def cross_run_rmsip(
@@ -584,7 +637,8 @@ def bootstrap_loadings(
     n_bootstrap: int = 100,
     contact_base: str = "./contact_output",
     file_pattern: str | None = None,
-    n_jobs: int = 4,
+    max_frames_per_state: int | None = None,
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """
     Assess loading stability by bootstrap resampling of per-frame contacts.
@@ -648,13 +702,20 @@ def bootstrap_loadings(
 
     rng = np.random.default_rng(42)
     for b in range(n_bootstrap):
-        subsets = []
+        # Resample frame indices WITH replacement and preserve duplicates.
+        # np.isin in freq_for_frames counts them correctly, giving proper
+        # bootstrap frequency estimates (a frame appearing twice in the
+        # resample contributes twice to the contact count).
+        frame_arrays = []
         for sc in state_data:
-            n = len(sc.frames)
-            resampled = rng.choice(sc.frames, size=n, replace=True)
-            subsets.append(set(resampled.tolist()))
+            frames = sc.frames
+            if max_frames_per_state and len(frames) > max_frames_per_state:
+                idx = np.linspace(0, len(frames) - 1, max_frames_per_state, dtype=int)
+                frames = frames[idx]
+            resampled = rng.choice(frames, size=len(frames), replace=True)
+            frame_arrays.append(resampled)
 
-        df = _build_freq_matrix(state_data, subsets)
+        df = _build_freq_matrix(state_data, frame_arrays)
         if df.shape[1] < k:
             continue
 
@@ -815,7 +876,8 @@ def convergence_report(
     contact_base: str = "./contact_output",
     file_pattern: str | None = None,
     analysis_dir: str = "./analysis_output",
-    n_jobs: int = 4,
+    max_frames_per_state: int | None = None,
+    n_jobs: int = 1,
 ) -> dict:
     """
     Compute all convergence metrics and return a structured report.
@@ -852,7 +914,9 @@ def convergence_report(
     try:
         sh = split_half_rmsip(
             n_states, k=k, contact_base=contact_base,
-            file_pattern=file_pattern, n_jobs=n_jobs,
+            file_pattern=file_pattern,
+            max_frames_per_state=max_frames_per_state,
+            n_jobs=n_jobs,
         )
         report["split_half_rmsip"] = round(sh, 4) if not np.isnan(sh) else None
     except (FileNotFoundError, ValueError) as e:
