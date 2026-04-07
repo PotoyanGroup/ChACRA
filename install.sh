@@ -175,12 +175,12 @@ cat <<EOF > _post_install.sh
 #!/bin/bash
 set -e
 echo "  mpi4py (against system MPI: \$(which mpicc))"
-pip install --no-cache-dir $CUPY_PKG
-pip install --no-cache-dir mpi4py
-pip install --no-cache-dir "git+https://github.com/Dan-Burns/femto.git"
-pip install --no-cache-dir --no-deps "git+https://github.com/Dan-Burns/getcontacts.git"
-pip install --no-cache-dir --no-deps "git+https://github.com/Dan-Burns/ultracontacts.git"
-pip install --no-cache-dir -e "\$(pwd)"
+python -m pip install --no-cache-dir $CUPY_PKG
+python -m pip install --no-cache-dir mpi4py
+python -m pip install --no-cache-dir "git+https://github.com/Dan-Burns/femto.git"
+python -m pip install --no-cache-dir --no-deps "git+https://github.com/Dan-Burns/getcontacts.git"
+python -m pip install --no-cache-dir --no-deps "git+https://github.com/Dan-Burns/ultracontacts.git"
+python -m pip install --no-cache-dir -e "\$(pwd)"
 EOF
 
 chmod +x _post_install.sh
