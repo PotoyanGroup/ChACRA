@@ -67,7 +67,7 @@ else
 fi
 echo "Using: $CONDA_CMD"
 
-ENV_NAME=$(grep -E "^name:" environment.yaml | awk '{print $2}')
+ENV_NAME=$(grep -E "^name:" env/environment.yaml | awk '{print $2}')
 ENV_NAME="${ENV_NAME:-chacra-env}"
 echo "Environment: $ENV_NAME"
 
@@ -83,40 +83,61 @@ if [ "$ENV_EXISTS" == "true" ]; then
     # ── Existing env: just update ──────────────────────────────────────────────
     echo ""
     echo "Environment already exists — updating..."
-    $CONDA_CMD env update -n "$ENV_NAME" -f environment.yaml
+    $CONDA_CMD env update -n "$ENV_NAME" -f env/environment.yaml
 
 else
-    # ── Fresh install ──────────────────────────────────────────────────────────
-    # Prefer a pre-solved lock file: zero solving, works on any RAM.
-    # Fall back to sequential group installs if no lock file is available.
+    # ── Fresh install ──────────────────────────────────────────────────────
+    # Priority order:
+    #   1. @EXPLICIT spec file  (fastest — no solving, no extra tools)
+    #   2. conda-lock YAML      (no solving, but needs conda-lock installed)
+    #   3. Sequential group installs (slowest — full solver, high RAM)
 
+    EXPLICIT_FILE=""
     LOCK_FILE=""
-    if [ -n "$CUDA_MAJOR" ] && [ -f "conda-lock.cuda${CUDA_MAJOR}.yml" ]; then
-        LOCK_FILE="conda-lock.cuda${CUDA_MAJOR}.yml"
-    elif [ -f "conda-lock.yml" ]; then
-        LOCK_FILE="conda-lock.yml"
+
+    # 1) Look for @EXPLICIT spec files
+    if [ -n "$CUDA_MAJOR" ] && [ -f "env/explicit-cuda${CUDA_MAJOR}.txt" ]; then
+        EXPLICIT_FILE="env/explicit-cuda${CUDA_MAJOR}.txt"
+    elif [ -f "env/explicit.txt" ]; then
+        EXPLICIT_FILE="env/explicit.txt"
     fi
 
-    if [ -n "$LOCK_FILE" ]; then
-        # ── Lock file path ─────────────────────────────────────────────────────
+    # 2) Look for conda-lock YAML files
+    if [ -n "$CUDA_MAJOR" ] && [ -f "env/conda-lock.cuda${CUDA_MAJOR}.yml" ]; then
+        LOCK_FILE="env/conda-lock.cuda${CUDA_MAJOR}.yml"
+    elif [ -f "env/conda-lock.yml" ]; then
+        LOCK_FILE="env/conda-lock.yml"
+    fi
+
+    if [ -n "$EXPLICIT_FILE" ]; then
+        # ── Explicit spec path (fastest) ───────────────────────────────────
+        echo ""
+        echo "Found explicit spec: $EXPLICIT_FILE"
+        echo "Installing directly (no solving, no extra tools)..."
+        $CONDA_CMD create -n "$ENV_NAME" --file "$EXPLICIT_FILE" -y
+
+    elif [ -n "$LOCK_FILE" ]; then
+        # ── conda-lock YAML path ──────────────────────────────────────────
         echo ""
         echo "Found lock file: $LOCK_FILE"
         echo "Installing from lock file (no solving required)..."
 
         if ! command -v conda-lock &>/dev/null; then
-            echo "Installing conda-lock..."
+            echo "conda-lock not found — installing into base environment..."
+            echo "(Tip: generate explicit-*.txt files with 'bash tools/generate_locks.sh'"
+            echo " to skip this step on future installs.)"
             $CONDA_CMD install -n base -y -c conda-forge conda-lock
         fi
 
         conda-lock install -n "$ENV_NAME" "$LOCK_FILE"
 
     else
-        # ── No lock file: sequential group installs ────────────────────────────
+        # ── No lock file: sequential group installs ────────────────────────
         # Solving 30+ CUDA-aware packages simultaneously can exhaust RAM.
         # Installing in small anchored groups keeps each solve small.
         echo ""
-        echo "No lock file found. Installing in sequential groups..."
-        echo "(To generate a lock file for faster installs on other machines:"
+        echo "No lock or explicit spec files found. Installing in sequential groups..."
+        echo "(To generate spec files for faster installs on other machines:"
         echo "  bash tools/generate_locks.sh)"
         echo ""
 
@@ -167,6 +188,11 @@ else
 fi
 
 # ── 5. Pip post-install ───────────────────────────────────────────────────────
+
+# Ensure pip is available (lock/explicit files generated before pip was added
+# to environment.yaml won't have it)
+$CONDA_CMD run -n "$ENV_NAME" python -m ensurepip --upgrade 2>/dev/null || \
+    $CONDA_CMD install -n "$ENV_NAME" -y pip 2>/dev/null || true
 
 echo ""
 echo "Installing $CUPY_PKG, mpi4py, femto, getcontacts, ultracontacts, chacra..."

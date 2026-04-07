@@ -49,17 +49,29 @@ subdirs:
       __cuda: "${LOCK_CUDA}"
 VPEOF
 
-LOCK_FILE="conda-lock.cuda${CUDA_MAJOR}.yml"
+LOCK_FILE="env/conda-lock.cuda${CUDA_MAJOR}.yml"
 
 conda-lock \
-    -f environment.yaml \
+    -f env/environment.yaml \
     --virtual-package-spec _vp_tmp.yml \
     --lockfile "$LOCK_FILE" \
     -p linux-64
 
 rm _vp_tmp.yml
 
+# Convert to @EXPLICIT spec file (no conda-lock needed on target machines)
+EXPLICIT_FILE="env/explicit-cuda${CUDA_MAJOR}.txt"
 echo ""
-echo "Lock file written: $LOCK_FILE"
-echo "Commit this file.  On target machines, install with:"
-echo "    conda-lock install -n chacra-env $LOCK_FILE"
+echo "Converting to explicit spec file..."
+python tools/lock_to_explicit.py "$LOCK_FILE" "$EXPLICIT_FILE"
+
+echo ""
+echo "Generated:"
+echo "  $LOCK_FILE       (conda-lock YAML — requires conda-lock to install)"
+echo "  $EXPLICIT_FILE   (@EXPLICIT spec  — works with plain conda/mamba/micromamba)"
+echo ""
+echo "Commit both files.  On target machines, install with:"
+echo "    bash install.sh"
+echo ""
+echo "(install.sh will prefer the explicit spec file — no extra tools needed)"
+
