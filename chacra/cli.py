@@ -10,6 +10,7 @@ Commands::
     run-hremd           Run an HREMD simulation
     run-femto           Run femto HREMD (low-level, called by run-hremd via MPI)
     process-output      Process HREMD output (state trajectories → contacts → analysis)
+    benchmark-hremd     Benchmark HREMD throughput and exchange statistics
     make-simulation     Solvate a structure and create an OpenMM system
     project             Set up the ChACRA project directory
     get-state-contacts  Run contact calculations on existing state trajectories
@@ -23,6 +24,7 @@ COMMANDS = {
     "run-femto":          "chacra.scripts.run_femto_hremd",
     "process-output":     "chacra.scripts.process_hremd_output",
     "check-convergence":  "chacra.scripts.check_convergence",
+    "benchmark-hremd":    "chacra.scripts.benchmark_hremd",
     "make-simulation":    "chacra.scripts.make_simulation",
     "project":            "chacra.scripts.project_setup",
     "get-state-contacts": "chacra.scripts.get_state_contacts",
