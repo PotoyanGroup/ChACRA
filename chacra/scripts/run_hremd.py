@@ -211,8 +211,37 @@ def main():
     os.environ.setdefault("TQDM_MININTERVAL", "600")  # once every 10 minutes if enabled
     os.environ.setdefault("OMP_NUM_THREADS", "1")
 
+    # ------------------------------------------------------------------ #
+    # Detect incomplete (crashed) runs                                    #
+    #                                                                     #
+    # If hremd-outputs/checkpoint.pkl exists but the corresponding        #
+    # replica_trajectories/run_N/ does NOT, the previous attempt crashed  #
+    # before completion.  Femto will resume from its checkpoint and run   #
+    # only the remaining cycles, so we must pass the SAME total_cycles    #
+    # that was used originally.                                           #
+    # ------------------------------------------------------------------ #
+    live_checkpoint = "./hremd-outputs/checkpoint.pkl"
+    run_dir_exists = os.path.isdir(
+        f"./replica_trajectories/run_{current_run}"
+    )
+    resuming_crashed_run = (
+        os.path.exists(live_checkpoint) and not run_dir_exists
+    )
+
+    if resuming_crashed_run:
+        print(
+            f"\n{'='*60}\n"
+            f"  RESUMING interrupted run {current_run}\n"
+            f"  Checkpoint found: {live_checkpoint}\n"
+            f"  Femto will pick up from the last checkpointed cycle.\n"
+            f"{'='*60}\n"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Determine n_systems                                                 #
+    # ------------------------------------------------------------------ #
     if current_run > 1:
-        # Load data from the previous run to verify / infer n_systems
+        # Load data from the previous completed run to verify / infer n_systems
         df = load_femto_data(
             f"replica_trajectories/run_{current_run - 1}/samples.arrow"
         )
@@ -236,16 +265,41 @@ def main():
             )
         n_systems = args.n_systems
 
-    
-    # Get the number of cycles run thus far
-    # Get the number of cycles run thus far
-    if current_run == 1:
-        total_cycles = args.n_cycles
+    # ------------------------------------------------------------------ #
+    # Compute total_cycles (the absolute cycle count femto targets)       #
+    #                                                                     #
+    # Fresh run:  total_cycles = prior_completed + n_cycles               #
+    # Resume:     total_cycles = same value from chacra_run.json          #
+    # ------------------------------------------------------------------ #
+    if resuming_crashed_run:
+        # Reuse the total_cycles that was computed when this run first
+        # started.  This guarantees femto targets the same endpoint.
+        saved_total = run_config.get("_total_cycles")
+        if saved_total is not None:
+            total_cycles = int(saved_total)
+            print(f"  Using saved total_cycles={total_cycles} from config.")
+        else:
+            # Fallback: config predates this field — recompute like a fresh run
+            print(
+                "  Warning: _total_cycles not found in config. "
+                "Recomputing from n_cycles."
+            )
+            if current_run == 1:
+                total_cycles = args.n_cycles
+            else:
+                cycles_completed = (
+                    int((df["step"].values / args.steps_per_cycle)[-1]) + 1
+                )
+                total_cycles = cycles_completed + args.n_cycles
     else:
-        cycles_completed = (
-            int((df["step"].values / args.steps_per_cycle)[-1]) + 1
-        )
-        total_cycles = cycles_completed + args.n_cycles
+        # Fresh run — compute total_cycles normally
+        if current_run == 1:
+            total_cycles = args.n_cycles
+        else:
+            cycles_completed = (
+                int((df["step"].values / args.steps_per_cycle)[-1]) + 1
+            )
+            total_cycles = cycles_completed + args.n_cycles
 
     # ------------------------------------------------------------------ #
     # Restore checkpoint so femto can resume (continuation runs only)     #
@@ -253,9 +307,8 @@ def main():
     # there and femto will silently restart from cycle 0, producing       #
     # trajectories that are ~(total_cycles / new_cycles) × too large.     #
     # ------------------------------------------------------------------ #
-    if current_run > 1:
+    if current_run > 1 and not resuming_crashed_run:
         os.makedirs("./hremd-outputs", exist_ok=True)
-        live_checkpoint = "./hremd-outputs/checkpoint.pkl"
         prev_checkpoint = (
             f"./replica_trajectories/run_{current_run - 1}/checkpoint.pkl"
         )
@@ -320,8 +373,8 @@ def main():
     temps = np.geomspace(args.min_temp, args.max_temp, n_systems).tolist()
 
     # ------------------------------------------------------------------ #
-    # Write / update chacra_run.json (first run creates it; later runs    #
-    # update current_run and any overridden fields).                      #
+    # Write / update chacra_run.json                                      #
+    # Includes _total_cycles so crash recovery can reuse the same target  #
     # ------------------------------------------------------------------ #
     run_config.update(
         system_file=args.system_file,
@@ -331,6 +384,7 @@ def main():
         max_temp=args.max_temp,
         temps=temps,
         n_cycles=args.n_cycles,
+        _total_cycles=total_cycles,
         steps_per_cycle=args.steps_per_cycle,
         save_interval=args.save_interval,
         checkpoint_interval=args.checkpoint_interval,
@@ -358,6 +412,13 @@ def main():
         if not _fmpi.is_mps_running():
             print("Starting CUDA MPS daemon...")
             _fmpi.start_mps()
+
+    print(
+        f"\n  Run {current_run}: {total_cycles} total cycles "
+        f"({args.n_cycles} new) × {args.steps_per_cycle} steps/cycle"
+    )
+    if resuming_crashed_run:
+        print("  Femto will skip already-completed cycles automatically.\n")
 
     try:
         log_dir = Path(f"./analysis_output/run_{current_run}")
@@ -411,7 +472,9 @@ def main():
         subprocess.run(analysis_command, check=False)
 
         # Update current_run in JSON after successful completion
+        # Clear _total_cycles since this run is done
         run_config.config["current_run"] = current_run
+        run_config.config.pop("_total_cycles", None)
         run_config.write(_CONFIG_PATH)
 
         # Write human-readable stats
@@ -424,14 +487,24 @@ def main():
             f.write(f"checkpoint_interval : {args.checkpoint_interval}\n")
 
     except subprocess.CalledProcessError as e:
-        print("Error: The subprocess call failed.")
-        print("Return Code:", e.returncode)
-        print("Standard Output:", e.stdout)
-        print("Standard Error:", e.stderr)
+        print("\n" + "="*60)
+        print("  HREMD run failed.")
+        print(f"  Return code: {e.returncode}")
+        print(f"  Check logs:  analysis_output/run_{current_run}/hremd_stderr.log")
+        print()
+        print("  To resume from the last checkpoint, just re-run:")
+        print("    chacra run-hremd")
+        print("  (settings will be read from chacra_run.json automatically)")
+        print("="*60 + "\n")
 
     except Exception:
-        print("An unexpected error occurred:")
+        print("\n" + "="*60)
+        print("  An unexpected error occurred:")
         traceback.print_exc()
+        print()
+        print("  To resume from the last checkpoint, just re-run:")
+        print("    chacra run-hremd")
+        print("="*60 + "\n")
 
 
 if __name__ == "__main__":
