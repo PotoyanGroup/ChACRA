@@ -24,12 +24,26 @@ from chacra.convergence import (
 )
 
 
-def _discover_n_states(contact_base: str, run: int) -> int | None:
+def _discover_n_states(contact_base: str, run: int, file_pattern: str | None = None) -> int | None:
     """Figure out n_states by counting contact files."""
+    from pathlib import Path
+
+    if file_pattern is not None:
+        # Count distinct state indices by trying 0, 1, 2... until none match
+        base = Path(contact_base)
+        n = 0
+        while True:
+            glob_pat = file_pattern.format(state=n)
+            if any(base.glob(glob_pat)):
+                n += 1
+            else:
+                break
+        return n if n > 0 else None
+
+    # Default layout: count cont_state_* files in the run's contacts dir
     contacts_dir = os.path.join(contact_base, f"run_{run}", "contacts")
     if not os.path.isdir(contacts_dir):
         return None
-    # Count cont_state_*.parquet or cont_state_*.tsv files
     count = 0
     for f in os.listdir(contacts_dir):
         if f.startswith("cont_state_") and (f.endswith(".parquet") or f.endswith(".tsv")):
@@ -91,6 +105,25 @@ def main():
         "--analysis_dir", type=str, default="./analysis_output",
         help="Path to analysis output directory.",
     )
+    parser.add_argument(
+        "--file_pattern", type=str, default=None,
+        metavar="PATTERN",
+        help=(
+            "Glob pattern (relative to --contact_base) for per-state contact files.\n"
+            "Use {state} as a placeholder for the state index.  Examples:\n"
+            "  run_*/rep_{state}_contacts.tsv       (custom naming, multi-run)\n"
+            "  contacts/rep_{state}_contacts.tsv    (flat single-run directory)\n"
+            "Default: standard ChACRA layout (run_*/contacts/cont_state_{state}.*)"
+        ),
+    )
+    parser.add_argument(
+        "--n_states", type=int, default=None,
+        help=(
+            "Number of thermodynamic states.  Auto-discovered when using the "
+            "default layout.  Required (or strongly recommended) when "
+            "--file_pattern is specified."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -111,17 +144,29 @@ def main():
     else:
         run = _discover_latest_run(args.contact_base)
         if run is None:
-            sys.exit(f"[check-convergence] No runs found in {args.contact_base}/")
+            run = 1  # sensible default when using custom file_pattern
+            if args.file_pattern is None:
+                sys.exit(f"[check-convergence] No runs found in {args.contact_base}/")
 
     # Determine n_states
-    n_states = _discover_n_states(args.contact_base, run)
-    if n_states is None:
-        sys.exit(
-            f"[check-convergence] No contact files found for run {run} "
-            f"under {args.contact_base}/run_{run}/contacts/"
+    if args.n_states is not None:
+        n_states = args.n_states
+    else:
+        n_states = _discover_n_states(args.contact_base, run, args.file_pattern)
+    if n_states is None or n_states == 0:
+        msg = (
+            f"[check-convergence] No contact files found for run {run}.\n"
         )
+        if args.file_pattern:
+            msg += f"  Pattern searched: {args.contact_base}/{args.file_pattern.format(state='N')}\n"
+            msg += "  Tip: pass --n_states explicitly to skip auto-discovery."
+        else:
+            msg += f"  Expected: {args.contact_base}/run_{run}/contacts/cont_state_*.{{tsv,parquet}}"
+        sys.exit(msg)
 
     print(f"[check-convergence] Run {run}, {n_states} states, k={args.k}")
+    if args.file_pattern:
+        print(f"[check-convergence] File pattern: {args.contact_base}/{args.file_pattern}")
 
     # Load exchange probabilities if available
     exch_path = os.path.join(args.analysis_dir, f"run_{run}", "exchange_probabilities.npy")
@@ -134,6 +179,7 @@ def main():
         exchange_probs=exchange_probs,
         k=args.k,
         contact_base=args.contact_base,
+        file_pattern=args.file_pattern,
         analysis_dir=args.analysis_dir,
         n_jobs=args.n_jobs,
     )
@@ -171,6 +217,7 @@ def main():
             n_top=20,
             n_bootstrap=args.n_bootstrap,
             contact_base=args.contact_base,
+            file_pattern=args.file_pattern,
             n_jobs=args.n_jobs,
         )
         stability_path = os.path.join(out_dir, "bootstrap_loading_stability.csv")

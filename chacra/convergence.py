@@ -81,13 +81,44 @@ class _StateContacts:
 def _find_contact_files(
     state_idx: int,
     contact_base: str = "./contact_output",
+    file_pattern: str | None = None,
 ) -> list[tuple[str, str]]:
     """
     Find per-frame contact files for a given state across all runs.
 
+    Parameters
+    ----------
+    state_idx : int
+        Thermodynamic state index.
+    contact_base : str
+        Root directory to search in.
+    file_pattern : str or None
+        Glob pattern relative to ``contact_base`` with ``{state}`` as the
+        placeholder for the state index.  Supports ``*`` wildcards for
+        run directories.  Examples::
+
+            "run_*/contacts/cont_state_{state}.tsv"   # default layout
+            "run_*/rep_{state}_contacts.tsv"           # custom naming
+            "contacts/rep_{state}_contacts.tsv"        # flat, single-run
+
+        When None, the standard ChACRA layout is used:
+        ``run_*/contacts/cont_state_{state}.{parquet,tsv}``.
+
     Returns list of (path, format) where format is ``'parquet'`` or ``'tsv'``.
     """
     base = Path(contact_base)
+
+    if file_pattern is not None:
+        # Expand {state} and glob for matching files, sorted for stable ordering
+        glob_pat = file_pattern.format(state=state_idx)
+        matched = sorted(base.glob(glob_pat))
+        files = []
+        for path in matched:
+            fmt = "parquet" if path.suffix == ".parquet" else "tsv"
+            files.append((str(path), fmt))
+        return files
+
+    # Default: standard ChACRA layout
     files = []
     for run_dir in sorted(base.glob("run_*/contacts")):
         parquet = run_dir / f"cont_state_{state_idx}.parquet"
@@ -206,16 +237,22 @@ def _load_tsv_contacts(
 def _load_state_contacts(
     state_idx: int,
     contact_base: str = "./contact_output",
+    file_pattern: str | None = None,
 ) -> _StateContacts:
     """
     Load all per-frame contacts for a thermodynamic state, combining
     data from all runs with frame offsets to avoid index collisions.
     """
-    files = _find_contact_files(state_idx, contact_base)
+    files = _find_contact_files(state_idx, contact_base, file_pattern)
     if not files:
+        hint = (
+            f"Searched for pattern '{file_pattern.format(state=state_idx)}' "
+            f"under {contact_base}/"
+            if file_pattern
+            else f"under {contact_base}/run_*/contacts/cont_state_{state_idx}.*"
+        )
         raise FileNotFoundError(
-            f"No per-frame contact files found for state {state_idx} "
-            f"under {contact_base}/run_*/contacts/"
+            f"No per-frame contact files found for state {state_idx}. {hint}"
         )
 
     all_frames = []
@@ -242,8 +279,8 @@ def _load_state_contacts(
 
 def _load_state_worker(args: tuple) -> _StateContacts:
     """Multiprocessing wrapper for _load_state_contacts."""
-    state_idx, contact_base = args
-    return _load_state_contacts(state_idx, contact_base)
+    state_idx, contact_base, file_pattern = args
+    return _load_state_contacts(state_idx, contact_base, file_pattern)
 
 
 def _build_freq_matrix(
@@ -321,6 +358,7 @@ def split_half_rmsip(
     n_states: int,
     k: int = 3,
     contact_base: str = "./contact_output",
+    file_pattern: str | None = None,
     n_jobs: int = 4,
 ) -> float:
     """
@@ -355,7 +393,7 @@ def split_half_rmsip(
         n_jobs = cpu_count()
 
     # Phase 1: Load per-frame data for all states (parallel)
-    args = [(i, contact_base) for i in range(n_states)]
+    args = [(i, contact_base, file_pattern) for i in range(n_states)]
     with Pool(min(n_jobs, n_states)) as pool:
         state_data = pool.map(_load_state_worker, args)
 
@@ -545,6 +583,7 @@ def bootstrap_loadings(
     n_top: int = 20,
     n_bootstrap: int = 100,
     contact_base: str = "./contact_output",
+    file_pattern: str | None = None,
     n_jobs: int = 4,
 ) -> pd.DataFrame:
     """
@@ -584,7 +623,7 @@ def bootstrap_loadings(
 
     # Phase 1: Load all contact data (parallel)
     print("  [bootstrap] Loading per-frame contact data...")
-    load_args = [(i, contact_base) for i in range(n_states)]
+    load_args = [(i, contact_base, file_pattern) for i in range(n_states)]
     with Pool(min(n_jobs, n_states)) as pool:
         state_data = pool.map(_load_state_worker, load_args)
     state_data.sort(key=lambda sc: sc.state_idx)
@@ -774,6 +813,7 @@ def convergence_report(
     exchange_probs: np.ndarray | None = None,
     k: int = 3,
     contact_base: str = "./contact_output",
+    file_pattern: str | None = None,
     analysis_dir: str = "./analysis_output",
     n_jobs: int = 4,
 ) -> dict:
@@ -811,7 +851,8 @@ def convergence_report(
     # 1. Split-half RMSIP (from per-frame contacts)
     try:
         sh = split_half_rmsip(
-            n_states, k=k, contact_base=contact_base, n_jobs=n_jobs,
+            n_states, k=k, contact_base=contact_base,
+            file_pattern=file_pattern, n_jobs=n_jobs,
         )
         report["split_half_rmsip"] = round(sh, 4) if not np.isnan(sh) else None
     except (FileNotFoundError, ValueError) as e:
