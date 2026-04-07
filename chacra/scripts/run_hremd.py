@@ -248,6 +248,34 @@ def main():
         total_cycles = cycles_completed + args.n_cycles
 
     # ------------------------------------------------------------------ #
+    # Restore checkpoint so femto can resume (continuation runs only)     #
+    # If hremd-outputs/ was cleaned between runs the checkpoint won't be  #
+    # there and femto will silently restart from cycle 0, producing       #
+    # trajectories that are ~(total_cycles / new_cycles) × too large.     #
+    # ------------------------------------------------------------------ #
+    if current_run > 1:
+        os.makedirs("./hremd-outputs", exist_ok=True)
+        live_checkpoint = "./hremd-outputs/checkpoint.pkl"
+        prev_checkpoint = (
+            f"./replica_trajectories/run_{current_run - 1}/checkpoint.pkl"
+        )
+        if not os.path.exists(live_checkpoint):
+            if os.path.exists(prev_checkpoint):
+                shutil.copy(prev_checkpoint, live_checkpoint)
+                print(
+                    f"Restored checkpoint from "
+                    f"replica_trajectories/run_{current_run - 1}/ "
+                    f"into hremd-outputs/ for femto resume."
+                )
+            else:
+                print(
+                    "WARNING: No checkpoint found in hremd-outputs/ or "
+                    f"replica_trajectories/run_{current_run - 1}/. "
+                    "Femto will start from cycle 0 — trajectories will be "
+                    f"{total_cycles} cycles long instead of {args.n_cycles}."
+                )
+
+    # ------------------------------------------------------------------ #
     # Build run-femto args (run-femto always runs inside MPI now)         #
     # ------------------------------------------------------------------ #
     femto_args = [
