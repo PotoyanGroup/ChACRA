@@ -67,7 +67,7 @@ else
 fi
 echo "Using: $CONDA_CMD"
 
-ENV_NAME=$(grep -E "^name:" env/environment.yaml | awk '{print $2}')
+ENV_NAME=$(grep -E "^name:" conda/environment.yaml | awk '{print $2}')
 ENV_NAME="${ENV_NAME:-chacra-env}"
 echo "Environment: $ENV_NAME"
 
@@ -83,7 +83,7 @@ if [ "$ENV_EXISTS" == "true" ]; then
     # ── Existing env: just update ──────────────────────────────────────────────
     echo ""
     echo "Environment already exists — updating..."
-    $CONDA_CMD env update -n "$ENV_NAME" -f env/environment.yaml
+    $CONDA_CMD env update -n "$ENV_NAME" -f conda/environment.yaml
 
 else
     # ── Fresh install ──────────────────────────────────────────────────────
@@ -96,17 +96,17 @@ else
     LOCK_FILE=""
 
     # 1) Look for @EXPLICIT spec files
-    if [ -n "$CUDA_MAJOR" ] && [ -f "env/explicit-cuda${CUDA_MAJOR}.txt" ]; then
-        EXPLICIT_FILE="env/explicit-cuda${CUDA_MAJOR}.txt"
-    elif [ -f "env/explicit.txt" ]; then
-        EXPLICIT_FILE="env/explicit.txt"
+    if [ -n "$CUDA_MAJOR" ] && [ -f "conda/explicit-cuda${CUDA_MAJOR}.txt" ]; then
+        EXPLICIT_FILE="conda/explicit-cuda${CUDA_MAJOR}.txt"
+    elif [ -f "conda/explicit.txt" ]; then
+        EXPLICIT_FILE="conda/explicit.txt"
     fi
 
     # 2) Look for conda-lock YAML files
-    if [ -n "$CUDA_MAJOR" ] && [ -f "env/conda-lock.cuda${CUDA_MAJOR}.yml" ]; then
-        LOCK_FILE="env/conda-lock.cuda${CUDA_MAJOR}.yml"
-    elif [ -f "env/conda-lock.yml" ]; then
-        LOCK_FILE="env/conda-lock.yml"
+    if [ -n "$CUDA_MAJOR" ] && [ -f "conda/conda-lock.cuda${CUDA_MAJOR}.yml" ]; then
+        LOCK_FILE="conda/conda-lock.cuda${CUDA_MAJOR}.yml"
+    elif [ -f "conda/conda-lock.yml" ]; then
+        LOCK_FILE="conda/conda-lock.yml"
     fi
 
     if [ -n "$EXPLICIT_FILE" ]; then

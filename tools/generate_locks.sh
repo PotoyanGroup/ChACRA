@@ -49,10 +49,10 @@ subdirs:
       __cuda: "${LOCK_CUDA}"
 VPEOF
 
-LOCK_FILE="env/conda-lock.cuda${CUDA_MAJOR}.yml"
+LOCK_FILE="conda/conda-lock.cuda${CUDA_MAJOR}.yml"
 
 conda-lock \
-    -f env/environment.yaml \
+    -f conda/environment.yaml \
     --virtual-package-spec _vp_tmp.yml \
     --lockfile "$LOCK_FILE" \
     -p linux-64
@@ -60,7 +60,7 @@ conda-lock \
 rm _vp_tmp.yml
 
 # Convert to @EXPLICIT spec file (no conda-lock needed on target machines)
-EXPLICIT_FILE="env/explicit-cuda${CUDA_MAJOR}.txt"
+EXPLICIT_FILE="conda/explicit-cuda${CUDA_MAJOR}.txt"
 echo ""
 echo "Converting to explicit spec file..."
 python tools/lock_to_explicit.py "$LOCK_FILE" "$EXPLICIT_FILE"
