@@ -305,6 +305,43 @@ def _load_state_worker(args: tuple) -> _StateContacts:
     return _load_state_contacts(state_idx, contact_base, file_pattern)
 
 
+def _load_all_states(
+    n_states: int,
+    contact_base: str,
+    file_pattern: str | None,
+    n_jobs: int,
+) -> list[_StateContacts]:
+    """
+    Load contact data for all states, with automatic fallback.
+
+    When n_jobs > 1, tries multiprocessing first.  If the resulting
+    _StateContacts objects are too large to pickle through the pipe
+    (BrokenPipeError), falls back to sequential loading automatically.
+    """
+    args = [(i, contact_base, file_pattern) for i in range(n_states)]
+
+    if n_jobs == 1:
+        print(f"  Loading {n_states} states sequentially...")
+        state_data = [_load_state_worker(a) for a in args]
+    else:
+        try:
+            with Pool(min(n_jobs, n_states)) as pool:
+                state_data = pool.map(_load_state_worker, args)
+        except (BrokenPipeError, OSError, Exception) as e:
+            # _StateContacts too large to pickle through the pipe
+            if "Broken pipe" in str(e) or "BrokenPipe" in type(e).__name__:
+                print(
+                    f"  [warning] Parallel loading failed (data too large to "
+                    f"serialize). Falling back to sequential loading..."
+                )
+                state_data = [_load_state_worker(a) for a in args]
+            else:
+                raise
+
+    state_data.sort(key=lambda sc: sc.state_idx)
+    return state_data
+
+
 def _build_freq_matrix(
     state_data: list[_StateContacts],
     frame_arrays: list[np.ndarray],
@@ -417,16 +454,7 @@ def split_half_rmsip(
         n_jobs = cpu_count()
 
     # Phase 1: Load per-frame data for all states.
-    # Default n_jobs=1 (sequential) to avoid doubling peak RAM when states are
-    # large; set n_jobs > 1 only on machines with ample memory.
-    args = [(i, contact_base, file_pattern) for i in range(n_states)]
-    if n_jobs == 1:
-        state_data = [_load_state_worker(a) for a in args]
-    else:
-        with Pool(min(n_jobs, n_states)) as pool:
-            state_data = pool.map(_load_state_worker, args)
-
-    state_data.sort(key=lambda sc: sc.state_idx)
+    state_data = _load_all_states(n_states, contact_base, file_pattern, n_jobs)
 
     # Phase 2: Split frames and build frequency matrices.
     # Use searchsorted on sorted int32 arrays — no set copies needed.
@@ -675,12 +703,9 @@ def bootstrap_loadings(
     if n_jobs is None or n_jobs <= 0:
         n_jobs = cpu_count()
 
-    # Phase 1: Load all contact data (parallel)
+    # Phase 1: Load all contact data
     print("  [bootstrap] Loading per-frame contact data...")
-    load_args = [(i, contact_base, file_pattern) for i in range(n_states)]
-    with Pool(min(n_jobs, n_states)) as pool:
-        state_data = pool.map(_load_state_worker, load_args)
-    state_data.sort(key=lambda sc: sc.state_idx)
+    state_data = _load_all_states(n_states, contact_base, file_pattern, n_jobs)
 
     # Collect all contact names
     all_contacts = set()
