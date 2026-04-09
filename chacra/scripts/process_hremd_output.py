@@ -444,15 +444,20 @@ def main():
                     env = os.environ.copy()
                     env["CUDA_VISIBLE_DEVICES"] = str(gpu_offset)
 
-                    proc = subprocess.Popen(cmd, env=env)
+                    proc = subprocess.Popen(
+                        cmd, env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
                     processes.append((state_idx, proc))
 
                 for state_idx, proc in processes:
-                    proc.wait()
+                    _, stderr = proc.communicate()
                     if proc.returncode != 0:
+                        err_msg = stderr.decode().strip() if stderr else ""
                         print(
                             f"  [WARN] ultracontacts failed for state {state_idx} "
-                            f"(exit code {proc.returncode}). Continuing."
+                            f"(exit code {proc.returncode}). {err_msg}"
                         )
         else:
             print(f"  Engine: getcontacts (CPU)")
@@ -519,6 +524,7 @@ def main():
                             "--condensed",
                         ],
                         check=True,
+                        capture_output=True,
                     )
                 except subprocess.CalledProcessError as e:
                     print(
