@@ -15,6 +15,7 @@ Commands::
     project             Set up the ChACRA project directory
     get-state-contacts  Run contact calculations on existing state trajectories
     windowed-freqs      Compute contact frequencies from a frame window or percentile cutoffs
+    response            Single-state cumulant estimator for R^(1)/R^(2) (collapses lambda ladder)
 """
 
 import importlib
@@ -30,6 +31,7 @@ COMMANDS = {
     "project":            "chacra.scripts.project_setup",
     "get-state-contacts": "chacra.scripts.get_state_contacts",
     "windowed-freqs":     "chacra.scripts.windowed_freqs",
+    "response":           "chacra.scripts.run_response",
 }
 
 
