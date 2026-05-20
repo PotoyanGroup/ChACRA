@@ -5,6 +5,15 @@ import warnings
 
 import pandas as pd
 import psutil
+from openmm.app import (
+    PDBFile, Modeller, ForceField, Simulation, PME, HBonds,
+)
+from openmm import (
+    LangevinMiddleIntegrator, MonteCarloBarostat, XmlSerializer,
+)
+from openmm.unit import (
+    nanometer, bar, picosecond, femtoseconds, molar, atomic_mass_unit,
+)
 
 warnings.filterwarnings(
     "ignore",
@@ -194,7 +203,7 @@ class OMMSetup:
     Class to piece together an openmm simulation object
     '''
 
-    def __init__(self, 
+    def __init__(self,
                  structures,
                  nonbonded_cutoff=1,
                  forcefields=['amber14-all.xml', 'amber14/tip3pfb.xml'],
@@ -206,10 +215,6 @@ class OMMSetup:
                  Hmass=2.0,
                  timestep=2,
                  ):
-        from openmm.app import PDBFile, Modeller, ForceField, Simulation, PME, HBonds
-        from openmm import LangevinMiddleIntegrator, MonteCarloBarostat, XmlSerializer
-        from openmm.unit import nanometer, bar, picosecond, femtoseconds, molar, atomic_mass_unit
-
         self.structures = structures
         self.nonbonded_cutoff = nonbonded_cutoff*nanometer
         self.integrator_type = LangevinMiddleIntegrator
