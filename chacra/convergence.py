@@ -292,10 +292,17 @@ def _load_state_contacts(
         if len(frames) > 0:
             offset = int(frames.max()) + 1
 
+    # Convert merged sets → sorted int32 arrays, honoring the _StateContacts
+    # contract (split_half_rmsip / freq_for_frames call np.searchsorted /
+    # np.isin, which require sorted 1-D arrays — a set becomes a 0-d object
+    # array and raises "object of too small depth for desired array").
     return _StateContacts(
         state_idx=state_idx,
         frames=np.concatenate(all_frames) if all_frames else np.array([], dtype=int),
-        pair_frames=dict(all_pair_frames),
+        pair_frames={
+            pair: np.array(sorted(fset), dtype=np.int32)
+            for pair, fset in all_pair_frames.items()
+        },
     )
 
 

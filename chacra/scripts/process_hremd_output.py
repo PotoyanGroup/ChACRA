@@ -641,38 +641,44 @@ def main():
     )
 
     # ---------------------------------------------------------------------- #
-    # Convergence diagnostics (disabled — pending rework of split-half RMSIP  #
-    # to use windowed-freqs approach for memory efficiency)                    #
+    # Convergence diagnostics                                                 #
+    #                                                                         #
+    # Re-enabled after fixing the split-half RMSIP crash (_load_state_contacts#
+    # returned per-pair frame *sets*, but the estimator calls np.searchsorted #
+    # which needs sorted arrays).  max_frames_per_state caps the per-state    #
+    # frame load so the split-half computation stays memory-bounded on large  #
+    # systems / long runs.                                                    #
     # ---------------------------------------------------------------------- #
-    # # Load exchange probs for this run (saved in stage 2)
-    # exch_path = f"./analysis_output/run_{run}/exchange_probabilities.npy"
-    # exchange_probs = np.load(exch_path) if os.path.exists(exch_path) else None
-    #
-    # k_convergence = len(cf.cpca.top_chacras) if cf.cpca.top_chacras else 3
-    # report = convergence_report(
-    #     run=run,
-    #     n_states=n_states,
-    #     exchange_probs=exchange_probs,
-    #     k=k_convergence,
-    #     n_jobs=args.n_jobs,
-    # )
-    # save_convergence_report(report, f"./analysis_output/run_{run}")
-    # print_convergence_report(report)
-    #
-    # # Exchange diagnostics plot
-    # if exchange_probs is not None:
-    #     fig = plot_exchange_diagnostics(
-    #         exchange_probs,
-    #         filename=f"./analysis_output/run_{run}/exchange_diagnostics.png",
-    #     )
-    #     fig.clf()
-    #
-    # # Convergence history plot (across all runs)
-    # fig = plot_convergence_history(
-    #     filename=f"./analysis_output/convergence_history.png",
-    # )
-    # if fig is not None:
-    #     fig.clf()
+    # Load exchange probs for this run (saved in stage 2)
+    exch_path = f"./analysis_output/run_{run}/exchange_probabilities.npy"
+    exchange_probs = np.load(exch_path) if os.path.exists(exch_path) else None
+
+    k_convergence = len(cf.cpca.top_chacras) if cf.cpca.top_chacras else 3
+    report = convergence_report(
+        run=run,
+        n_states=n_states,
+        exchange_probs=exchange_probs,
+        k=k_convergence,
+        max_frames_per_state=5000,
+        n_jobs=args.n_jobs,
+    )
+    save_convergence_report(report, f"./analysis_output/run_{run}")
+    print_convergence_report(report)
+
+    # Exchange diagnostics plot
+    if exchange_probs is not None:
+        fig = plot_exchange_diagnostics(
+            exchange_probs,
+            filename=f"./analysis_output/run_{run}/exchange_diagnostics.png",
+        )
+        fig.clf()
+
+    # Convergence history plot (across all runs)
+    fig = plot_convergence_history(
+        filename=f"./analysis_output/convergence_history.png",
+    )
+    if fig is not None:
+        fig.clf()
 
     # ---------------------------------------------------------------------- #
     # Finalize                                                                #
