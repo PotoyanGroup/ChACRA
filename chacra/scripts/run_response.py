@@ -138,7 +138,7 @@ def main():
         if not tc_path.exists():
             sys.exit(f"  missing {tc_path} — run process-output first.")
         cdf = pd.read_parquet(tc_path)
-        from chacra.utils import RunConfig
+        from chacra.run_config import RunConfig
         cfg = RunConfig(str(project / "chacra_run.json"))
         temps = np.array(cfg.get("temps"))
         cf = ContactFrequencies(cdf, temps=np.round(temps), n_jobs=1)

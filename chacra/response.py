@@ -579,7 +579,7 @@ def estimate_response_from_chacra_run(
         passed explicitly when scoring an older run recorded with a
         different interval (e.g. run_4 at 10 after run_5 rewrote it to 2).
     """
-    from chacra.utils import RunConfig
+    from chacra.run_config import RunConfig
 
     project_dir = Path(project_dir)
     cfg_path = project_dir / "chacra_run.json"
