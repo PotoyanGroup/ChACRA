@@ -103,6 +103,33 @@ def _freq_exists(run: int, state_idx: int) -> bool:
     )
 
 
+def _run_weight(run: int, selection_file: str) -> float:
+    """
+    Weight of a run for cumulative averaging: number of exchange cycles
+    (read from the femto samples table), falling back to the number of
+    saved frames when the samples table is unavailable.  Returns 0 for a
+    run with neither.
+    """
+    samples = Path(f"./replica_trajectories/run_{run}/samples.arrow")
+    if samples.exists():
+        import pyarrow
+
+        with pyarrow.OSFile(str(samples), "rb") as fh, \
+             pyarrow.RecordBatchStreamReader(fh) as reader:
+            n = 0
+            for batch in reader:
+                n += batch.num_rows
+        return float(n)
+    xtc = f"./state_trajectories/run_{run}/state_0.xtc"
+    if os.path.exists(xtc):
+        print(
+            f"  [process-output] run_{run}: no samples.arrow; weighting by "
+            "saved frames instead of cycles."
+        )
+        return float(len(mda.Universe(selection_file, xtc).trajectory))
+    return 0.0
+
+
 def _accumulate_contacts(
     run: int,
     current_run_df: pd.DataFrame,
@@ -125,15 +152,11 @@ def _accumulate_contacts(
 
     prior_df = pd.read_parquet(prior_parquet)
 
-    # Recover frame counts via MDAnalysis (only needs 1 IO call per run)
-    current_xtc = f"./state_trajectories/run_{run}/state_0.xtc"
-    current_frames = len(mda.Universe(selection_file, current_xtc).trajectory) if os.path.exists(current_xtc) else 1
-
-    prior_total_frames = 0
-    for i in range(1, run):
-        prior_xtc = f"./state_trajectories/run_{i}/state_0.xtc"
-        if os.path.exists(prior_xtc):
-            prior_total_frames += len(mda.Universe(selection_file, prior_xtc).trajectory)
+    # Weight runs by simulated time (exchange cycles), not by saved frames:
+    # two runs of equal length saved at different save_intervals must
+    # contribute equally to the cumulative frequencies.
+    current_frames = _run_weight(run, selection_file)
+    prior_total_frames = sum(_run_weight(i, selection_file) for i in range(1, run))
 
     total_frames = prior_total_frames + current_frames
 
@@ -206,6 +229,13 @@ def main():
         type=int,
         default=10,
         help="Save trajectory data at this cycle interval.",
+    )
+    parser.add_argument(
+        "--contact_itypes",
+        type=str,
+        default=None,
+        help="Space-separated ultracontacts interaction types (e.g. 'hb sb vdw' "
+             "or 'all').  Default: value in chacra_run.json, else 'all'.",
     )
     parser.add_argument(
         "--output_selection",
@@ -402,6 +432,16 @@ def main():
     n_gpus = len(gpus)
     use_ultracontacts = n_gpus > 0
     openmm_sys = getattr(args, "system_file", None) or run_config.get("system_file")
+    # ultracontacts' own default is the polar subset (hb sb ps ts pc). ChACRA's
+    # reference datasets (getcontacts, --itypes all) include vdW and
+    # hydrophobic contacts, so "all" is the default here to keep the
+    # observable comparable across engines.
+    contact_itypes = (
+        args.contact_itypes or run_config.get("contact_itypes") or "all"
+    )
+    if isinstance(contact_itypes, str):
+        contact_itypes = contact_itypes.split()
+    run_config.update(contact_itypes=" ".join(contact_itypes))
 
     if run_stage3:
         # Which states need contacts?
@@ -437,6 +477,7 @@ def main():
                         "--trajectory", f"./state_trajectories/run_{run}/state_{state_idx}.xtc",
                         "--output", contacts_out,
                         "--stride", "1",
+                        "--itypes", *contact_itypes,
                     ]
                     if openmm_sys and os.path.exists(openmm_sys):
                         cmd.extend(["--openmm-system", str(openmm_sys)])

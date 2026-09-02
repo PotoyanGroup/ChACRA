@@ -53,6 +53,56 @@ def get_num_states(df: pd.DataFrame) -> int:
     return df["u_kn"][0].shape[0]
 
 
+def saved_frame_rows(
+    df: pd.DataFrame, save_interval: int, traj_len: int | None = None
+) -> np.ndarray:
+    """
+    Row indices of the femto samples table that correspond to saved
+    trajectory frames.
+
+    femto writes a trajectory frame when the *absolute* cycle number satisfies
+    ``cycle % trajectory_interval == 0``.  A continuation run whose first cycle
+    is not a multiple of ``save_interval`` therefore has its first frame at row
+    ``(-first_cycle) % save_interval`` — not at row 0.  Slicing ``[::save_interval]``
+    from row 0 (the historical behaviour) mislabels every frame's state on such
+    runs.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        State data output from femto (needs the ``step`` column).
+    save_interval : int
+        femto ``trajectory_interval`` in cycles.
+    traj_len : int, optional
+        Number of frames actually present in the replica trajectories; the
+        result is truncated to this length.
+
+    Returns
+    -------
+    np.ndarray of int row indices, one per saved frame.
+    """
+    steps = np.asarray(df["step"], dtype=np.int64)
+    if len(steps) == 0:
+        return np.array([], dtype=int)
+    if len(steps) > 1:
+        steps_per_cycle = int(np.min(np.diff(steps)))
+        if steps_per_cycle <= 0:
+            raise ValueError("femto 'step' column is not strictly increasing.")
+    else:
+        steps_per_cycle = int(steps[0]) if steps[0] > 0 else 1
+    cycles = steps // steps_per_cycle
+    rows = np.where(cycles % save_interval == 0)[0]
+    offset = int((-cycles[0]) % save_interval)
+    if offset != 0:
+        print(
+            f"  [process_hremd] first cycle {cycles[0]} is not a multiple of "
+            f"save_interval={save_interval}; first saved frame is row {offset}."
+        )
+    if traj_len is not None:
+        rows = rows[:traj_len]
+    return rows
+
+
 def sort_replica_trajectories(
     df: pd.DataFrame, save_interval: int, traj_len: int
 ) -> dict:
@@ -82,9 +132,8 @@ def sort_replica_trajectories(
     # have to know traj_len because there could be additional rows in the
     # state_data between the final saved frame and the next frame that would have
     # been saved.
-    replica_to_state_idx = np.vstack(
-        (df["replica_to_state_idx"][::save_interval]).values[:traj_len]
-    )
+    rows = saved_frame_rows(df, save_interval, traj_len)
+    replica_to_state_idx = np.vstack(df["replica_to_state_idx"].values[rows])
 
     for replica in range(n_states):
         for state in range(n_states):

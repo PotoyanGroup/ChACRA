@@ -244,8 +244,13 @@ def load_perturbation_energy_femto(
     else:
         raise ValueError(f"unknown method={method!r}")
 
-    # Subsample to the trajectory save cadence so dU aligns with phi.
-    dU = dU_per_cycle[::save_interval]
+    # Subsample to the trajectory save cadence so dU aligns with phi.  femto
+    # saves frames at absolute cycle % save_interval == 0, so the first saved
+    # row of a continuation run is generally not row 0.
+    from chacra.trajectories.process_hremd import saved_frame_rows
+
+    rows = saved_frame_rows(df, save_interval)
+    dU = dU_per_cycle[rows]
     return dU, float(delta_k)
 
 
@@ -519,10 +524,20 @@ def compare_to_pca(
     pc1_dict = dict(zip(pca_contacts, pc1))
     pc2_dict = dict(zip(pca_contacts, pc2)) if pc2 is not None else None
 
-    aligned_names = [c for c in contact_names if c in pc1_dict]
-    R1_a = np.array([R1_dict[c] for c in aligned_names])
-    pc1_a = np.array([pc1_dict[c] for c in aligned_names])
-    pc2_a = np.array([pc2_dict[c] for c in aligned_names]) if pc2_dict else None
+    # Union alignment: a contact that never forms at the reference state has
+    # phi == 0 on every frame and therefore R1 == 0 exactly; dropping it (the
+    # old intersection behaviour) silently removes PCA-loaded contacts from
+    # the comparison.  Contacts absent from the PCA get loading 0.
+    seen = set()
+    aligned_names = [
+        c for c in list(contact_names) + list(pca_contacts)
+        if not (c in seen or seen.add(c))
+    ]
+    R1_a = np.array([R1_dict.get(c, 0.0) for c in aligned_names])
+    pc1_a = np.array([pc1_dict.get(c, 0.0) for c in aligned_names])
+    pc2_a = (
+        np.array([pc2_dict.get(c, 0.0) for c in aligned_names]) if pc2_dict else None
+    )
 
     only_in_R1 = sum(1 for c in contact_names if c not in pc1_dict)
     only_in_pca = sum(1 for c in pca_contacts if c not in R1_dict)

@@ -951,9 +951,16 @@ def convergence_report(
             n_jobs=n_jobs,
         )
         report["split_half_rmsip"] = round(sh, 4) if not np.isnan(sh) else None
-    except (FileNotFoundError, ValueError) as e:
-        print(f"  [convergence] Split-half RMSIP skipped: {e}")
+    except FileNotFoundError as e:
+        print(f"  [convergence] Split-half RMSIP skipped (no per-frame data): {e}")
         report["split_half_rmsip"] = None
+    except Exception as e:  # noqa: BLE001 — surface, don't swallow
+        import traceback
+
+        print("  [convergence] Split-half RMSIP FAILED:")
+        traceback.print_exc()
+        report["split_half_rmsip"] = None
+        report["split_half_error"] = f"{type(e).__name__}: {e}"
     report["split_half_label"] = _rmsip_label(report["split_half_rmsip"])
 
     # 2. Cross-run RMSIP (from cumulative frequency matrices)
