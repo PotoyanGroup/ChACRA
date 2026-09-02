@@ -481,16 +481,23 @@ def compare_to_pca(
     n_only_in_pca, pc1_aligned, R1_aligned, contact_names_aligned.
     """
     # Pull PC1, PC2 loadings + contact order out of cf.
-    # ChACRA's ContactFrequencies stores a fitted ChACRAModes on .cpca with
-    # `.norm_loadings` and `.original_loadings`. We use the (unscaled) loadings
-    # so the cosine is direction-only.
+    # Must use SIGNED loadings: `norm_loadings` is per-PC |loading|/max
+    # (sign-stripped), which structurally depresses the cosine — a contact
+    # that melts in and a contact that melts out both count as positive.
     cpca = cf.cpca
-    if hasattr(cpca, "norm_loadings"):
-        loadings = np.asarray(cpca.norm_loadings)
+    if hasattr(cpca, "loadings"):
+        loadings = np.asarray(cpca.loadings)
     elif hasattr(cpca, "original_loadings"):
         loadings = np.asarray(cpca.original_loadings)
-    elif hasattr(cpca, "loadings"):
-        loadings = np.asarray(cpca.loadings)
+    elif hasattr(cpca, "norm_loadings"):
+        import warnings
+
+        warnings.warn(
+            "compare_to_pca: only sign-stripped `norm_loadings` available; "
+            "cos_pc1_R1 will be structurally depressed.",
+            stacklevel=2,
+        )
+        loadings = np.asarray(cpca.norm_loadings)
     else:
         raise AttributeError(
             "Could not find PC loadings on cf.cpca "
@@ -543,6 +550,7 @@ def estimate_response_from_chacra_run(
     run: int = 1,
     state_idx: int | None = None,
     method: str = "central",
+    save_interval: int | None = None,
 ) -> ResponseResult:
     """Run the full single-state estimator on a ChACRA project directory.
 
@@ -565,6 +573,11 @@ def estimate_response_from_chacra_run(
         Reference state. Defaults to n_states // 2.
     method : {"central", "forward", "backward"}
         Finite-difference rule for dU/dk; see `load_perturbation_energy_femto`.
+    save_interval : int, optional
+        Contact-frame spacing in cycles for THIS run. Defaults to the value
+        in chacra_run.json — which reflects the LATEST run, so it must be
+        passed explicitly when scoring an older run recorded with a
+        different interval (e.g. run_4 at 10 after run_5 rewrote it to 2).
     """
     from chacra.utils import RunConfig
 
@@ -576,7 +589,8 @@ def estimate_response_from_chacra_run(
     if not samples.exists():
         raise FileNotFoundError(f"missing femto samples: {samples}")
 
-    save_interval = int(cfg.get("save_interval") or 1)
+    if save_interval is None:
+        save_interval = int(cfg.get("save_interval") or 1)
     temps = cfg.get("temps")
     if temps is None:
         raise ValueError(
@@ -607,7 +621,18 @@ def estimate_response_from_chacra_run(
     )
 
     # Truncate to common length — femto can have a partial last cycle.
+    # A LARGE mismatch is not a partial tail: it means save_interval does not
+    # match how this run's contact frames were actually saved, and silently
+    # truncating would pair phi frames with the wrong cycles' dU (garbage
+    # covariance that still yields a plausible-looking R1).
     n = min(phi.shape[0], dU.shape[0])
+    if n < 0.95 * max(phi.shape[0], dU.shape[0]):
+        raise ValueError(
+            f"phi/dU length mismatch: {phi.shape[0]} contact frames vs "
+            f"{dU.shape[0]} strided dU values (save_interval={save_interval}). "
+            "chacra_run.json holds the LATEST run's save_interval — pass "
+            "save_interval= explicitly for the interval this run was saved at."
+        )
     if n != phi.shape[0] or n != dU.shape[0]:
         phi = phi[:n]
         dU = dU[:n]

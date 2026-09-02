@@ -44,9 +44,14 @@ def _discover_n_states(contact_base: str, run: int, file_pattern: str | None = N
     contacts_dir = os.path.join(contact_base, f"run_{run}", "contacts")
     if not os.path.isdir(contacts_dir):
         return None
+    # Match only the per-frame files (cont_state_<N>.parquet/.tsv) — the same
+    # directory also holds cont_state_<N>_frequencies.parquet summaries, which
+    # must not be counted as extra states.
+    import re
+
     count = 0
     for f in os.listdir(contacts_dir):
-        if f.startswith("cont_state_") and (f.endswith(".parquet") or f.endswith(".tsv")):
+        if re.fullmatch(r"cont_state_\d+\.(parquet|tsv)", f):
             count += 1
     return count if count > 0 else None
 

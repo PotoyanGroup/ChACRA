@@ -52,6 +52,12 @@ def main():
         help="Skip the R^(2) (third-cumulant) estimate.",
     )
     parser.add_argument(
+        "--save_interval", type=int, default=None,
+        help="Contact-frame spacing (cycles) for THIS run. Required when "
+             "scoring an older run whose interval differs from the one in "
+             "chacra_run.json (which always reflects the latest run).",
+    )
+    parser.add_argument(
         "--compare_pca", action="store_true",
         help=(
             "Also load total_contacts.parquet, fit ContactFrequencies, and "
@@ -95,6 +101,7 @@ def main():
         run=args.run,
         state_idx=args.state_idx,
         method=args.method,
+        save_interval=args.save_interval,
     )
     if args.no_R2:
         result.R2 = None
