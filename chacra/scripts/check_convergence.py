@@ -40,7 +40,12 @@ def _discover_n_states(contact_base: str, run: int, file_pattern: str | None = N
                 break
         return n if n > 0 else None
 
-    # Default layout: count cont_state_* files in the run's contacts dir
+    # Preferred: the run's occupancy store knows its state count.
+    store = os.path.join(contact_base, f"run_{run}", "occupancy.npz")
+    if os.path.exists(store):
+        with np.load(store, allow_pickle=True) as z:
+            return int(z["phi"].shape[0])
+    # Else count per-replica or per-state contact files in the run's contacts dir
     contacts_dir = os.path.join(contact_base, f"run_{run}", "contacts")
     if not os.path.isdir(contacts_dir):
         return None
@@ -51,7 +56,7 @@ def _discover_n_states(contact_base: str, run: int, file_pattern: str | None = N
 
     count = 0
     for f in os.listdir(contacts_dir):
-        if re.fullmatch(r"cont_state_\d+\.(parquet|tsv)", f):
+        if re.fullmatch(r"cont_(state|replica)_\d+\.(parquet|tsv)", f):
             count += 1
     return count if count > 0 else None
 

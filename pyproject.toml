@@ -37,6 +37,9 @@ dev = [
     "pytest>=7",
     "pytest-cov",
 ]
+mbar = [
+    "pymbar>=4",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]  

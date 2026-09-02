@@ -306,6 +306,45 @@ def _load_state_contacts(
     )
 
 
+def _load_all_states_from_stores(
+    store_paths: list, n_states: int
+) -> list[_StateContacts]:
+    """
+    Build per-state ``_StateContacts`` from one or more occupancy stores
+    (runs are concatenated with frame offsets, as for the file loaders).
+    """
+    from chacra.reweight import OccupancyStore
+
+    per_state_pairs: list[dict[str, list]] = [defaultdict(list) for _ in range(n_states)]
+    per_state_frames: list[list] = [[] for _ in range(n_states)]
+    offset = 0
+    for path in store_paths:
+        store = OccupancyStore.load(path)
+        if store.n_states != n_states:
+            raise ValueError(f"{path}: {store.n_states} states, expected {n_states}")
+        for s in range(n_states):
+            phi = store.phi[s]
+            per_state_frames[s].append(np.arange(phi.shape[0], dtype=np.int32) + offset)
+            rows, cols = np.nonzero(phi)
+            order = np.argsort(cols, kind="stable")
+            cols, rows = cols[order], rows[order]
+            bounds = np.searchsorted(cols, np.arange(store.n_contacts + 1))
+            for c in range(store.n_contacts):
+                if bounds[c + 1] > bounds[c]:
+                    per_state_pairs[s][store.contacts[c]].append(
+                        (rows[bounds[c]:bounds[c + 1]] + offset).astype(np.int32))
+        offset += store.n_frames
+        del store
+    out = []
+    for s in range(n_states):
+        out.append(_StateContacts(
+            state_idx=s,
+            frames=np.concatenate(per_state_frames[s]),
+            pair_frames={p: np.concatenate(lst) for p, lst in per_state_pairs[s].items()},
+        ))
+    return out
+
+
 def _load_state_worker(args: tuple) -> _StateContacts:
     """Multiprocessing wrapper for _load_state_contacts."""
     state_idx, contact_base, file_pattern = args
@@ -326,6 +365,15 @@ def _load_all_states(
     (BrokenPipeError), falls back to sequential loading automatically.
     """
     args = [(i, contact_base, file_pattern) for i in range(n_states)]
+
+    # Preferred source: per-run occupancy stores (contact_output/run_*/occupancy.npz).
+    # One load gives every state's per-frame data; no per-state file parsing.
+    if file_pattern is None:
+        stores = sorted(Path(contact_base).glob("run_*/occupancy.npz"),
+                        key=lambda p: int(p.parent.name.split("_")[1]))
+        if stores:
+            print(f"  Loading {n_states} states from {len(stores)} occupancy store(s)...")
+            return _load_all_states_from_stores(stores, n_states)
 
     if n_jobs == 1:
         print(f"  Loading {n_states} states sequentially...")

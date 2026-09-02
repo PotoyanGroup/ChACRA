@@ -655,3 +655,122 @@ def freq_frames(freq_file: str | os.PathLike) -> int:
         frames = f.readline().strip().split()[1]
     frames = int(frames.split(":")[-1])
     return frames
+
+
+########## Replica-first path: strip, then (optionally) demux ##################
+
+
+def strip_replica_trajectory(
+    structure: str | os.PathLike,
+    trajectory: str | os.PathLike,
+    output: str | os.PathLike,
+    selection: str = "protein",
+) -> int:
+    """
+    Write the ``selection`` atoms of every frame of a full-system replica
+    trajectory to a compact XTC, streaming one frame at a time.
+
+    Returns the number of frames written.
+    """
+    u = mda.Universe(str(structure), str(trajectory))
+    sel = u.select_atoms(selection)
+    n = 0
+    with mda.Writer(str(output), n_atoms=sel.n_atoms) as w:
+        for _ in u.trajectory:
+            w.write(sel)
+            n += 1
+    return n
+
+
+def _strip_worker(args: tuple) -> tuple[int, int]:
+    replica, structure, trajectory, output, selection = args
+    return replica, strip_replica_trajectory(structure, trajectory, output, selection)
+
+
+def strip_replica_trajectories(
+    structure: str | os.PathLike,
+    traj_dir: str | os.PathLike,
+    output_dir: str | os.PathLike,
+    n_replicas: int,
+    selection: str = "protein",
+    n_jobs: int | None = None,
+    overwrite: bool = False,
+) -> list[str]:
+    """
+    Strip ``r{i}.dcd`` (full system) → ``output_dir/r{i}_{selection-tag}.xtc``
+    for every replica, in parallel.  Existing outputs are kept unless
+    ``overwrite``.  Returns the list of output paths (ordered by replica).
+    """
+    traj_dir = Path(traj_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outputs = [str(output_dir / f"r{i}_protein.xtc") for i in range(n_replicas)]
+    jobs = [
+        (i, str(structure), str(traj_dir / f"r{i}.dcd"), outputs[i], selection)
+        for i in range(n_replicas)
+        if overwrite or not os.path.exists(outputs[i])
+    ]
+    if jobs:
+        n_jobs = n_jobs if n_jobs and n_jobs > 0 else get_resources()["num_cores"]
+        with Pool(min(n_jobs, len(jobs))) as pool:
+            for replica, n in pool.imap_unordered(_strip_worker, jobs):
+                print(f"  [strip] replica {replica}: {n} frames")
+    return outputs
+
+
+def _demux_worker(args: tuple) -> tuple[int, int]:
+    state, protein_pdb, replica_xtcs, r2s, out_path, ref_path = args
+    universes = [mda.Universe(protein_pdb, x) for x in replica_xtcs]
+    ref = mda.Universe(ref_path if ref_path else protein_pdb)
+    n_fr = min(len(r2s), *[len(u.trajectory) for u in universes])
+    n = 0
+    with mda.Writer(out_path, n_atoms=universes[0].atoms.n_atoms) as w:
+        for j in range(n_fr):
+            reps = np.where(r2s[j] == state)[0]
+            if reps.size == 0:
+                continue
+            u = universes[int(reps[0])]
+            u.trajectory[j]
+            align.alignto(u.atoms, ref, select="name CA")
+            w.write(u.atoms)
+            n += 1
+    return state, n
+
+
+def demux_state_trajectories(
+    protein_pdb: str | os.PathLike,
+    replica_xtcs: list[str],
+    replica_to_state: np.ndarray,
+    output_dir: str | os.PathLike,
+    ref: str | os.PathLike | None = None,
+    n_jobs: int | None = None,
+) -> None:
+    """
+    Write chronological per-state trajectories ``state_{s}.xtc`` from
+    protein-only replica trajectories.
+
+    Parameters
+    ----------
+    protein_pdb : path
+        Topology matching the stripped replica trajectories.
+    replica_xtcs : list of paths
+        Output of :func:`strip_replica_trajectories`, ordered by replica.
+    replica_to_state : (n_frames, n_replicas) int
+        State of each replica on each saved frame (see
+        :func:`chacra.reweight.load_femto_reduced_potentials`).
+    output_dir : path
+    ref : path, optional
+        Structure to align C-alphas to (default: ``protein_pdb``).
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_states = replica_to_state.shape[1]
+    jobs = [
+        (s, str(protein_pdb), list(replica_xtcs), replica_to_state,
+         str(output_dir / f"state_{s}.xtc"), str(ref) if ref else None)
+        for s in range(n_states)
+    ]
+    n_jobs = n_jobs if n_jobs and n_jobs > 0 else get_resources()["num_cores"]
+    with Pool(min(n_jobs, n_states)) as pool:
+        for state, n in pool.imap_unordered(_demux_worker, jobs):
+            print(f"  [demux] state {state}: {n} frames")
