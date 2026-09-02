@@ -59,7 +59,16 @@ chacra run-hremd \
     -n 20
 ```
 
-`chacra run-hremd` automatically calls `chacra process-output` after simulation to generate state trajectories, run contact calculations (GPU-accelerated via `ultracontacts` when available), and produce ChACRA analysis.
+`chacra run-hremd` automatically calls `chacra process-output` after simulation. Processing strips femto's full-system replica trajectories to protein-only XTCs, runs the contact calculation once per replica (GPU-accelerated via `ultracontacts` when available; all interaction types by default), assigns every frame to its thermodynamic state with the exchange record, and produces the ChACRA analysis. State trajectories are not needed for the analysis; pass `--write_state_trajectories` to `chacra process-output` if you want them for visualisation.
+
+```bash
+# Response functions R(1), R(2) at any lambda (default: every sampled state and
+# lambda = 1, the physical Hamiltonian), pooled over ALL replicas with MBAR
+chacra response --run 1
+
+# Predicted response of every contact to perturbing each residue
+chacra perturb-scan --run 1
+```
 
 ### Restarts
 
@@ -73,9 +82,12 @@ Results are organized by run:
 
 | Directory | Contents |
 |---|---|
-| `state_trajectories/run_N/` | Per-state XTC trajectories |
-| `contact_output/run_N/` | Per-frame contacts and frequency files |
-| `analysis_output/run_N/` | ChACRA plots, `.pml` visualization, `top_chacra_contacts.csv` |
+| `replica_trajectories/run_N/protein/` | Protein-only replica XTCs (stripped from femto's DCDs) |
+| `contact_output/run_N/contacts/` | Per-replica per-frame contacts (`cont_replica_*.parquet`) |
+| `contact_output/run_N/occupancy.npz` | Per-state per-frame occupancy + reduced potentials (the single source for freqs, response functions, convergence) |
+| `contact_output/run_N/freqs/` | Per-state contact frequencies |
+| `analysis_output/run_N/` | ChACRA plots, `.pml` visualization, `top_chacra_contacts.csv`, `response_mbar_*`, `perturb_*` |
+| `state_trajectories/run_N/` | Per-state XTCs (only with `--write_state_trajectories`) |
 | `analysis_output/latest/` | Symlink to the most recent run |
 
 The `total_contacts.parquet` in each run's analysis reflects accumulated data across all runs. The `.pml` and `.csv` files reflect the combined analysis.
@@ -105,7 +117,9 @@ All commands are accessed via `chacra <command>`. Run `chacra <command> --help` 
 | Command | Description |
 |---|---|
 | `chacra run-hremd` | Run HREMD simulation + post-processing |
-| `chacra process-output` | Process HREMD output (trajectories → contacts → analysis) |
+| `chacra process-output` | Process HREMD output (strip → contacts per replica → occupancy store → analysis) |
+| `chacra response` | R(1), R(2) contact response functions, MBAR-pooled over the ladder (`--estimator single` for the one-replica cumulant) |
+| `chacra perturb-scan` | Predicted contact response to per-residue perturbations (contact-basis susceptibility, or OpenMM per-residue energy generator with `--generator energy`) |
 | `chacra make-simulation` | Solvate structure and create OpenMM system |
 | `chacra project` | Set up project directory |
 | `chacra windowed-freqs` | Compute contact frequencies for frame subsets (convergence analysis) |
@@ -114,8 +128,23 @@ All commands are accessed via `chacra <command>`. Run `chacra <command> --help` 
 
 ---
 
+## Response functions and perturbation scans
+
+ChACRA's chacras are principal components of the contact frequencies across the temperature ladder. The same data also give the *response functions* directly: femto evaluates every sampled configuration under every state's Hamiltonian, so MBAR can reweight all replicas to any scaling `lambda = beta_m/beta_0` and
+
+- `R(1)_k = d<phi_k>/dlambda = -Cov(phi_k, dU/dlambda)`
+- `R(2)_k = d2<phi_k>/dlambda2` (third-cumulant term plus the `d2U/dlambda2` correction)
+
+`chacra response` writes `response_mbar_{R1,R2,phi}.parquet` (rows = lambda) and a headline CSV at `--report_lambda` (default 1.0, the physical Hamiltonian) with block-bootstrap errors. Validate against the local finite-difference slope of the ladder (`cos_R1_ladder_slope` in the summary), not against PC1: PC1 is the ladder-averaged slope, and the local response rotates along the ladder.
+
+`chacra perturb-scan` uses the MBAR-weighted contact covariance `chi_kl = Cov(phi_k, phi_l)` to predict how every contact responds to perturbing each residue's contacts (`R = -chi M`, `M` the residue incidence matrix) and ranks residues by their projected effect on a target set (default: the top |PC1| contacts), excluding each residue's own contacts. `--generator energy` instead scales each residue's non-bonded parameters in OpenMM (`G_i = dU/ds_i`, one energy evaluation per residue per frame, run on a GPU with `--frame_stride`).
+
+Install `pip install pymbar` (optional) for a faster MBAR solve; a built-in self-consistent solver is used otherwise.
+
 ## Notes
 
+- **Continuation runs**: femto saves frames when the absolute cycle is a multiple of `save_interval`; ChACRA accounts for the offset when a continuation run starts at a non-multiple cycle. Keep `save_interval` fixed across runs where possible.
+- **Contact types**: `ultracontacts` alone defaults to polar contacts only; ChACRA passes `--itypes all` (configurable with `--contact_itypes` / `contact_itypes` in `chacra_run.json`) so the observable matches the getcontacts-based reference datasets.
 - **Replica count**: 20–40 replicas are typical for systems with 50k–300k particles, targeting ~15–25% exchange rates. This requires trial and error.
 - **GPU oversubscription**: Use `--oversubscribe 2` to run multiple replicas per GPU simultaneously via NVIDIA MPS.
 - **Ligands**: Systems with ligands may require adding custom force names to femto's `_SUPPORTED_FORCES` list in `femto/md/rest.py`. HREMD scaling is limited to the protein.
