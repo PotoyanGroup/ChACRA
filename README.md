@@ -20,6 +20,8 @@ With ChACRA you can run the full pipeline — simulation, contact calculation, a
 - OpenMPI (`mpicc` on PATH)
 - conda (e.g. Miniforge), mamba, or micromamba
 
+> **Important (HPC users):** `mpi4py` is compiled against whichever MPI is active during installation. If you switch MPI modules later, you must reinstall mpi4py: `pip install --no-cache-dir --force-reinstall mpi4py`
+
 ### Install
 
 Run these from a terminal on a machine with internet access.
@@ -166,7 +168,8 @@ Install `pip install pymbar` (optional) for a faster MBAR solve; a built-in self
 - **Continuation runs**: femto saves frames when the absolute cycle is a multiple of `save_interval`; ChACRA accounts for the offset when a continuation run starts at a non-multiple cycle. Keep `save_interval` fixed across runs where possible.
 - **Contact types**: `ultracontacts` alone defaults to polar contacts only; ChACRA passes `--itypes all` (configurable with `--contact_itypes` / `contact_itypes` in `chacra_run.json`) so the observable matches the getcontacts-based reference datasets.
 - **Replica count**: 20–40 replicas are typical for systems with 50k–300k particles, targeting ~15–25% exchange rates. This requires trial and error.
-- **GPU oversubscription**: Use `--oversubscribe 2` to run multiple replicas per GPU simultaneously via NVIDIA MPS.
+- **CUDA MPS (multiple replicas per GPU)**: Use `--mps-replicas 2` (or `-r 2`) to run multiple replicas per GPU simultaneously via NVIDIA CUDA MPS. This increases throughput (up to a point) when you have more replicas than GPUs. benchmark-hremd will help you find the optimal number of simultaneous replicas per GPU for your system. Each GPU will process n mps-replicas simultaneously for a cycle and then consume the next n until all replicas are processed.
+- **Multi-node runs**: ChACRA supports multi-node MPI out of the box. Set `--n_jobs` to the total GPU count across all nodes and submit via your scheduler (e.g., SLURM). The MPI runtime distributes ranks across nodes automatically. Use `--mpi-command "srun --mpi=pmix"` if your cluster requires a specific launcher.
 - **Ligands**: Systems with ligands may require adding custom force names to femto's `_SUPPORTED_FORCES` list in `femto/md/rest.py`. HREMD scaling is limited to the protein.
 - **NaN errors**: Usually caused by inadequately minimized starting coordinates.
 - **CUDA PTX errors**: `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` means conda's CUDA toolkit is newer than your driver supports. The install script handles this automatically.
