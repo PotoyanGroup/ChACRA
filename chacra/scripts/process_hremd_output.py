@@ -241,7 +241,10 @@ def main():
     structure_file = args.structure_file
     if structure_file is None:
         parser.error("--structure_file is required (or set 'structure_file' in chacra_run.json).")
-    save_interval = int(args.save_interval or run_config.get("save_interval") or 1)
+    save_interval = args.save_interval or run_config.get("save_interval")
+    if save_interval is None:
+        parser.error("--save_interval is required (or set 'save_interval' in chacra_run.json).")
+    save_interval = int(save_interval)
 
     if run_config.get("temps") is not None:
         temps = np.array(run_config.get("temps"), dtype=float)

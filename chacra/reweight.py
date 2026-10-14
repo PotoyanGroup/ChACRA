@@ -303,7 +303,12 @@ def build_occupancy_store(
     cfg_path = project_dir / "chacra_run.json"
     cfg = RunConfig(str(cfg_path) if cfg_path.exists() else None)
     if save_interval is None:
-        save_interval = int(cfg.get("save_interval") or 1)
+        save_interval = cfg.get("save_interval")
+        if save_interval is None:
+            raise ValueError(
+                f"{cfg_path} has no 'save_interval'; pass save_interval= explicitly."
+            )
+        save_interval = int(save_interval)
     temps = cfg.get("temps")
     if temps is None:
         raise ValueError(f"{cfg_path} has no 'temps'; run process-output first.")

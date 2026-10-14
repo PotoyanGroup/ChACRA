@@ -605,7 +605,12 @@ def estimate_response_from_chacra_run(
         raise FileNotFoundError(f"missing femto samples: {samples}")
 
     if save_interval is None:
-        save_interval = int(cfg.get("save_interval") or 1)
+        save_interval = cfg.get("save_interval")
+        if save_interval is None:
+            raise ValueError(
+                f"{cfg_path} has no 'save_interval'; pass save_interval= explicitly."
+            )
+        save_interval = int(save_interval)
     temps = cfg.get("temps")
     if temps is None:
         raise ValueError(
