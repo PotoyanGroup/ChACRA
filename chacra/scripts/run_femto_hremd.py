@@ -111,6 +111,15 @@ def main():
         """,
         default=2
     )
+    parser.add_argument(
+        "--hremd_temperature", type=float, required=False, default=None,
+        help="""
+        Temperature (K) femto uses for beta in the stored reduced potentials and
+        in the swap test.  Defaults to --min_temp, the thermostat temperature of
+        every replica.  Older ChACRA runs left femto's own default (298.15 K);
+        a continuation of such a ladder must keep that value.
+        """,
+    )
     args = parser.parse_args()
 
     femto.md.utils.mpi.divide_gpus()
@@ -193,20 +202,21 @@ def main():
         platform=femto.md.constants.OpenMMPlatform.CUDA,
     )
 
-    # define how the HREMD should be run
-    hremd_config = femto.md.config.HREMD(
-        # the number of steps to run each replica for before starting to
-        # propose swaps
+    # define how the HREMD should be run.  The temperature sets beta for the
+    # stored reduced potentials and the swap test; it must be the thermostat
+    # temperature (min_temp) unless continuing a ladder started otherwise.
+    from chacra.simulation import build_hremd_config, femto_run_hremd_kwargs
+
+    hremd_temperature = (
+        args.hremd_temperature if args.hremd_temperature is not None else temp_min
+    )
+    hremd_config = build_hremd_config(
         n_warmup_steps=warmup_steps,
-        # the number of steps to run before proposing swaps
         n_steps_per_cycle=steps_per_cycle,
-        # the number of 'swaps' to propose - the total simulation length
-        # will be n_warmup_steps + n_steps * n_cycles
         n_cycles=cycles,
-        # the frequency with which to store trajectories of each replica.
-        # set to None to not store trajectories
-        trajectory_interval=save_interval,  # store every 10 * 500 steps.
+        trajectory_interval=save_interval,
         checkpoint_interval=checkpoint_interval,
+        temperature_K=hremd_temperature,
     )
     print(datetime.now().strftime("%H:%M"))
     femto.md.hremd.run_hremd(
@@ -215,7 +225,7 @@ def main():
         hremd_config,
         # the directory to store sampled reduced potentials and trajectories to
         output_dir=output_dir,
-        save_final_coords=False,
+        **femto_run_hremd_kwargs(save_final_coords=False),
     )
 
     print(datetime.now().strftime("%H:%M"))

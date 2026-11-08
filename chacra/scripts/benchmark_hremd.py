@@ -97,12 +97,16 @@ def _run_worker(args):
         platform=femto.md.constants.OpenMMPlatform.CUDA,
     )
 
-    hremd_config = femto.md.config.HREMD(
+    from chacra.simulation import build_hremd_config, femto_run_hremd_kwargs
+
+    hremd_config = build_hremd_config(
         n_warmup_steps=args.warmup_steps,
         n_steps_per_cycle=args.steps_per_cycle,
         n_cycles=args.n_cycles,
         trajectory_interval=args.save_interval,
         checkpoint_interval=args.checkpoint_interval,
+        temperature_K=args.min_temp,
+        verbose=False,
     )
 
     # Monkey-patch to capture exchange proposal time
@@ -145,7 +149,7 @@ def _run_worker(args):
             states,
             hremd_config,
             output_dir=output_dir,
-            save_final_coords=False,
+            **femto_run_hremd_kwargs(save_final_coords=False),
         )
 
         mpi_comm.barrier()

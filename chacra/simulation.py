@@ -349,3 +349,85 @@ def run_concurrently_with_mps(builder_func, configs, steps=1000):
     print(f"All simulations finished in {wall_time:.2f} seconds.")
     
     return results
+
+
+# --------------------------------------------------------------------------- #
+# femto HREMD configuration                                                    #
+# --------------------------------------------------------------------------- #
+
+FEMTO_DEFAULT_TEMPERATURE_K = 298.15
+"""femto's own default for ``HREMD.temperature`` (K).
+
+ChACRA runs before 2026-11 never set the field, so femto scored every stored
+reduced potential, and the swap acceptance test, with beta at this temperature
+while the thermostat ran at ``min_temp`` (290 K by default).  Analysis code
+rescales such legacy energies by ``298.15 / min_temp``; see
+:func:`chacra.reweight.OccupancyStore.load`.
+"""
+
+
+def build_hremd_config(
+    n_warmup_steps: int,
+    n_steps_per_cycle: int,
+    n_cycles: int,
+    trajectory_interval: int | None,
+    checkpoint_interval: int | None,
+    temperature_K: float,
+    verbose: bool = True,
+):
+    """
+    Return a ``femto.md.config.HREMD`` whose ``temperature`` is set explicitly.
+
+    femto uses ``temperature`` for beta in every stored reduced potential and in
+    the replica-exchange acceptance test.  Its default (298.15 K) silently
+    disagrees with the Langevin thermostat whenever ``min_temp`` is anything
+    else, so always pass the base (coldest, unscaled) REST2 temperature here.
+    """
+    import femto.md.config
+    import openmm.unit
+
+    if temperature_K is None or not float(temperature_K) > 0:
+        raise ValueError(f"temperature_K must be a positive number, got {temperature_K!r}")
+    config = femto.md.config.HREMD(
+        temperature=float(temperature_K) * openmm.unit.kelvin,
+        n_warmup_steps=n_warmup_steps,
+        n_steps_per_cycle=n_steps_per_cycle,
+        n_cycles=n_cycles,
+        trajectory_interval=trajectory_interval,
+        checkpoint_interval=checkpoint_interval,
+    )
+    if verbose:
+        print(f"HREMD reduced potentials and swap test evaluated at {float(temperature_K):.2f} K")
+    return config
+
+
+def femto_run_hremd_kwargs(save_final_coords: bool = False) -> dict:
+    """
+    Keyword arguments for ``femto.md.hremd.run_hremd`` that only newer femto
+    forks accept.
+
+    ``save_final_coords=False`` (Dan-Burns/femto from 457574f on) skips the final
+    all-rank coordinate gather.  Older installs raise ``TypeError`` on the
+    keyword, so it is passed only when the signature has it.
+    """
+    import inspect
+
+    import femto.md.hremd
+
+    params = inspect.signature(femto.md.hremd.run_hremd).parameters
+    return {"save_final_coords": save_final_coords} if "save_final_coords" in params else {}
+
+
+def barostat_temperature_from_xml(system_file: str) -> float | None:
+    """Default temperature (K) of the ``MonteCarloBarostat`` in an OpenMM system XML, or None."""
+    import re
+
+    with open(system_file) as fh:
+        xml = fh.read()
+    for m in re.finditer(r"<Force\b[^>]*>", xml):
+        tag = m.group(0)
+        if 'type="MonteCarloBarostat"' in tag:
+            t = re.search(r'defaultTemperature="([0-9.eE+-]+)"', tag)
+            if t:
+                return float(t.group(1))
+    return None

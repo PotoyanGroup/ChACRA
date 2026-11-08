@@ -52,8 +52,11 @@ def _make_store(n_frames=6000, seed=0):
         x = rng.normal(mu, sig, n_frames)
         phi[s] = (x[:, None] > thresholds[None, :]).astype(np.uint8)
         u[s] = A_CONST + 0.5 * x[:, None] ** 2 * lambdas[None, :] + x[:, None] * np.sqrt(lambdas)[None, :]
+    # a modern store records the temperature its u was scored at (no legacy rescale on load)
     return OccupancyStore(phi=phi, u=u, contacts=[f"c{i}" for i in range(C)],
-                          lambdas=lambdas, temps=temps), thresholds
+                          lambdas=lambdas, temps=temps,
+                          meta={"u_temperature": float(temps[0]),
+                                "u_source_temperature": float(temps[0])}), thresholds
 
 
 class TestEnergyDecomposition:
@@ -64,6 +67,21 @@ class TestEnergyDecomposition:
         np.testing.assert_allclose(a, A_CONST, atol=1e-8)
         # b = x^2/2, c = x  ->  b == c^2 / 2
         np.testing.assert_allclose(b, 0.5 * c ** 2, atol=1e-8)
+
+    def test_uniform_rescale_scales_coefficients_and_keeps_residual(self):
+        # the femto temperature correction multiplies u by a constant; the
+        # REST2 decomposition is linear in u, so (a, b, c) scale and the
+        # residual stays at machine precision.
+        store, _ = _make_store(n_frames=500)
+        a, b, c, resid = store.energy_decomposition()
+        factor = 298.15 / 290.0
+        scaled = OccupancyStore(phi=store.phi, u=store.u * factor, contacts=store.contacts,
+                                lambdas=store.lambdas, temps=store.temps)
+        a2, b2, c2, resid2 = scaled.energy_decomposition()
+        assert resid2 < 1e-8
+        np.testing.assert_allclose(a2, a * factor, atol=1e-8)
+        np.testing.assert_allclose(b2, b * factor, atol=1e-8)
+        np.testing.assert_allclose(c2, c * factor, atol=1e-8)
 
 
 class TestMBAR:
@@ -143,15 +161,28 @@ class TestResponseEstimator:
 class TestStoreIO:
     def test_roundtrip(self, tmp_path):
         store, _ = _make_store(n_frames=100)
-        store.meta = {"run": 1}
+        # a store that records the temperature its u was scored at round-trips untouched
+        store.meta = {"run": 1, "u_temperature": 300.0, "u_source_temperature": 300.0}
         p = tmp_path / "occ.npz"
         store.save(p)
         back = OccupancyStore.load(p)
         np.testing.assert_array_equal(back.phi, store.phi)
         np.testing.assert_allclose(back.u, store.u)
         assert back.contacts == store.contacts
-        assert back.meta == {"run": 1}
+        assert back.meta == {"run": 1, "u_temperature": 300.0, "u_source_temperature": 300.0}
         assert back.freqs().shape == (store.n_states, store.n_contacts)
+
+    def test_legacy_meta_is_rescaled_on_load(self, tmp_path):
+        # no u_temperature on record: femto scored u at 298.15 K while MD ran at temps[0]
+        store, _ = _make_store(n_frames=100)
+        store.meta = {"run": 1}
+        p = tmp_path / "legacy.npz"
+        store.save(p)
+        back = OccupancyStore.load(p, verbose=False)
+        np.testing.assert_allclose(back.u, store.u * (298.15 / 300.0))
+        assert back.meta["legacy_rescaled"] is True
+        raw = OccupancyStore.load(p, legacy_u_temperature=None)
+        np.testing.assert_allclose(raw.u, store.u)
 
 
 def test_pc_frame_fraction():

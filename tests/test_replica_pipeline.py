@@ -73,7 +73,8 @@ def project(tmp_path):
     (tmp_path / "replica_trajectories" / "run_1").mkdir(parents=True)
     _write_samples_arrow(tmp_path / "replica_trajectories/run_1/samples.arrow",
                          first_cycle, n_cycles, r2s, u)
-    json.dump({"temps": (290.0 / lam).tolist(), "save_interval": save_interval},
+    json.dump({"temps": (290.0 / lam).tolist(), "save_interval": save_interval,
+               "hremd_temperature": 290.0},
               open(tmp_path / "chacra_run.json", "w"))
     cdir = tmp_path / "contact_output/run_1/contacts"
     cdir.mkdir(parents=True)
@@ -117,6 +118,70 @@ class TestReplicaStore:
         back = OccupancyStore.load(p)
         # every contact is present on half of the frames at every state
         np.testing.assert_allclose(back.freqs().to_numpy().sum(axis=1), 0.5)
+        # a modern store carries its temperature metadata and is not rescaled
+        assert back.meta["u_temperature"] == 290.0
+        assert back.meta["u_source_temperature"] == 290.0
+        assert "legacy_rescaled" not in back.meta
+        np.testing.assert_allclose(back.u, store.u)
+
+
+class TestFemtoTemperatureCorrection:
+    """femto scored u at 298.15 K (its default) in every run before 2026-11;
+    the MD ran at temps[0].  Legacy data must be rescaled by 298.15 / temps[0]."""
+
+    FACTOR = 298.15 / 290.0
+
+    @staticmethod
+    def _drop_temperature_from_config(root):
+        cfg = json.load(open(root / "chacra_run.json"))
+        cfg.pop("hremd_temperature", None)
+        json.dump(cfg, open(root / "chacra_run.json", "w"))
+
+    def test_legacy_run_without_record_is_rescaled(self, project):
+        root, _, _ = project
+        self._drop_temperature_from_config(root)
+        store = build_occupancy_store(root, run=1, n_frames=N_FR, verbose=False)
+        a, b, c, resid = store.energy_decomposition()
+        assert resid < 1e-9
+        np.testing.assert_allclose(a, 5.0 * self.FACTOR, atol=1e-9)
+        assert store.meta["u_temperature"] == 290.0
+        assert store.meta["u_source_temperature"] == pytest.approx(298.15)
+
+    def test_run_meta_json_overrides_default(self, project):
+        root, _, _ = project
+        self._drop_temperature_from_config(root)
+        json.dump({"hremd_temperature": 290.0},
+                  open(root / "replica_trajectories/run_1/run_meta.json", "w"))
+        store = build_occupancy_store(root, run=1, n_frames=N_FR, verbose=False)
+        a, *_ = store.energy_decomposition()
+        np.testing.assert_allclose(a, 5.0, atol=1e-9)
+        assert store.meta["u_source_temperature"] == 290.0
+
+    def test_explicit_source_temperature_wins(self, project):
+        root, _, _ = project
+        store = build_occupancy_store(root, run=1, n_frames=N_FR, verbose=False,
+                                      u_source_temperature=580.0)
+        a, *_ = store.energy_decomposition()
+        np.testing.assert_allclose(a, 10.0, atol=1e-9)
+
+    def test_legacy_npz_rescaled_on_load(self, project, tmp_path):
+        root, _, _ = project
+        store = build_occupancy_store(root, run=1, n_frames=N_FR, verbose=False)
+        legacy = OccupancyStore(phi=store.phi, u=store.u, contacts=store.contacts,
+                                lambdas=store.lambdas, temps=store.temps,
+                                meta={"run": 1, "save_interval": 2})   # no u_temperature
+        p = tmp_path / "legacy.npz"
+        legacy.save(p)
+        back = OccupancyStore.load(p, verbose=False)
+        np.testing.assert_allclose(back.u, store.u * self.FACTOR)
+        assert back.meta["legacy_rescaled"] is True
+        assert back.meta["u_temperature"] == 290.0
+        untouched = OccupancyStore.load(p, legacy_u_temperature=None)
+        np.testing.assert_allclose(untouched.u, store.u)
+        assert "u_temperature" not in untouched.meta
+        # the file itself is not rewritten
+        again = OccupancyStore.load(p, legacy_u_temperature=None)
+        np.testing.assert_allclose(again.u, store.u)
 
 
 class TestConvergenceFromStore:

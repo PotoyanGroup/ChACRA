@@ -59,18 +59,25 @@ def _pca_loadings(project: Path, run: int, contacts, n_pcs: int = 3):
 
 def _run_mbar(args, project: Path, out_dir: Path):
     from chacra.reweight import (
+        LEGACY_U_TEMPERATURE,
         ResponseEstimator,
         cos_abs,
         get_occupancy_store,
         pc_frame,
     )
 
+    src_T = args.u_source_temperature
     store = get_occupancy_store(
         project, args.run, rebuild=args.rebuild_store,
         save_interval=args.save_interval,
+        u_source_temperature=src_T,
+        legacy_u_temperature=src_T if src_T is not None else LEGACY_U_TEMPERATURE,
     )
     print(f"[chacra response] store: {store.n_states} states x {store.n_frames} frames "
-          f"x {store.n_contacts} contacts (source: {store.meta.get('contact_source')})")
+          f"x {store.n_contacts} contacts (source: {store.meta.get('contact_source')}; "
+          f"u at {store.meta.get('u_temperature')} K, scored at "
+          f"{store.meta.get('u_source_temperature')} K"
+          f"{', legacy store rescaled' if store.meta.get('legacy_rescaled') else ''})")
     est = ResponseEstimator(store)
     print(f"[chacra response] REST2 decomposition residual: {est.fit_residual:.2e} "
           f"(should be ~1e-6; large values mean the Hamiltonian is not a + b*lam + c*sqrt(lam))")
@@ -139,6 +146,9 @@ def _run_mbar(args, project: Path, out_dir: Path):
             "n_states": store.n_states, "n_frames_per_state": store.n_frames,
             "n_contacts": store.n_contacts, "contact_source": store.meta.get("contact_source"),
             "decomposition_residual": est.fit_residual,
+            "u_temperature": store.meta.get("u_temperature"),
+            "u_source_temperature": store.meta.get("u_source_temperature"),
+            "legacy_rescaled": bool(store.meta.get("legacy_rescaled", False)),
             "f_k": est.f_k.tolist(),
             "report_lambda": head_lam, "n_boot": args.n_boot,
             "per_lambda": summary,
@@ -227,6 +237,11 @@ def main():
                    help="Also compute the single-state cumulant at each sampled state for comparison.")
     g.add_argument("--rebuild_store", action="store_true",
                    help="Rebuild contact_output/run_N/occupancy.npz even if cached.")
+    g.add_argument("--u_source_temperature", type=float, default=None,
+                   help="Temperature (K) femto scored the stored reduced potentials at. Default: the "
+                        "run's run_meta.json, then chacra_run.json 'hremd_temperature', else femto's "
+                        "default 298.15 K (every ChACRA run before 2026-11). Energies are rescaled to "
+                        "beta at temps[0].")
     # single-state options
     s = parser.add_argument_group("single-state estimator")
     s.add_argument("--state_idx", type=int, default=None, help="Reference replica. Default: ladder midpoint.")

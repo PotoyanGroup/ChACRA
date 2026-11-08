@@ -58,6 +58,12 @@ from scipy.special import logsumexp
 # Occupancy store                                                              #
 # --------------------------------------------------------------------------- #
 
+LEGACY_U_TEMPERATURE = 298.15
+"""Temperature (K) femto scored reduced potentials at in ChACRA runs that never
+set ``HREMD.temperature`` (every run before 2026-11).  The MD ran at
+``temps[0]``, so the correct reduced potential is ``u_stored * 298.15 / temps[0]``.
+A store whose ``meta`` lacks ``u_temperature`` is such a legacy store."""
+
 
 @dataclass
 class OccupancyStore:
@@ -115,11 +121,27 @@ class OccupancyStore:
         )
 
     @classmethod
-    def load(cls, path: str | os.PathLike) -> "OccupancyStore":
+    def load(
+        cls,
+        path: str | os.PathLike,
+        legacy_u_temperature: float | None = LEGACY_U_TEMPERATURE,
+        verbose: bool = True,
+    ) -> "OccupancyStore":
+        """
+        Load a cached store.
+
+        A store built before the femto temperature fix has no ``u_temperature``
+        in ``meta``: its ``u`` was scored with beta at ``legacy_u_temperature``
+        (femto's default, 298.15 K) while the MD ran at ``temps[0]``.  Such a
+        store is rescaled in memory by ``legacy_u_temperature / temps[0]`` and
+        flagged (``meta["legacy_rescaled"]``); pass ``legacy_u_temperature=None``
+        to load it untouched.  The file is not rewritten; rebuild the store to
+        persist the correction.
+        """
         import json
 
         with np.load(str(path), allow_pickle=True) as z:
-            return cls(
+            store = cls(
                 phi=z["phi"],
                 u=z["u"],
                 contacts=[str(c) for c in z["contacts"]],
@@ -127,6 +149,22 @@ class OccupancyStore:
                 temps=z["temps"],
                 meta=json.loads(str(z["meta"])),
             )
+        if "u_temperature" not in store.meta and legacy_u_temperature is not None:
+            t0 = float(store.temps[0])
+            factor = float(legacy_u_temperature) / t0
+            store.u = store.u * factor
+            store.meta.update(
+                u_temperature=t0,
+                u_source_temperature=float(legacy_u_temperature),
+                legacy_rescaled=True,
+            )
+            if verbose:
+                print(
+                    f"  [reweight] legacy store {Path(path).name}: reduced potentials "
+                    f"were scored at {legacy_u_temperature} K, MD ran at {t0} K; "
+                    f"rescaled u by {factor:.5f} (rebuild the store to persist)."
+                )
+        return store
 
     # -- derived quantities --------------------------------------------------
     def freqs(self) -> pd.DataFrame:
@@ -276,6 +314,38 @@ def load_femto_reduced_potentials(
     return u_state, r2s
 
 
+def run_meta_path(project_dir: str | os.PathLike, run: int) -> Path:
+    return Path(project_dir) / "replica_trajectories" / f"run_{run}" / "run_meta.json"
+
+
+def hremd_source_temperature(
+    project_dir: str | os.PathLike, run: int, cfg=None, verbose: bool = True
+) -> float:
+    """
+    Temperature (K) femto scored this run's reduced potentials at.
+
+    Looked up in ``replica_trajectories/run_N/run_meta.json`` (written by
+    ``run-hremd`` since the fix), then in ``chacra_run.json``
+    (``hremd_temperature``), else femto's default :data:`LEGACY_U_TEMPERATURE`.
+    """
+    import json
+
+    p = run_meta_path(project_dir, run)
+    if p.exists():
+        with open(p) as fh:
+            meta = json.load(fh)
+        if meta.get("hremd_temperature") is not None:
+            return float(meta["hremd_temperature"])
+    if cfg is not None and cfg.get("hremd_temperature") is not None:
+        return float(cfg.get("hremd_temperature"))
+    if verbose:
+        print(
+            f"  [reweight] run {run}: no hremd_temperature on record; assuming femto's "
+            f"default {LEGACY_U_TEMPERATURE} K (pre-2026-11 ChACRA runs)."
+        )
+    return LEGACY_U_TEMPERATURE
+
+
 def build_occupancy_store(
     project_dir: str | os.PathLike,
     run: int,
@@ -283,6 +353,7 @@ def build_occupancy_store(
     contacts_dir: str | os.PathLike | None = None,
     n_frames: int | None = None,
     verbose: bool = True,
+    u_source_temperature: float | None = None,
 ) -> OccupancyStore:
     """
     Build an :class:`OccupancyStore` for ``run`` of a ChACRA project.
@@ -296,6 +367,11 @@ def build_occupancy_store(
     ``n_frames`` (the replica trajectory length) is authoritative when given;
     otherwise the frame count is inferred from the contact files and must
     agree with the number of saved energy rows to within 5%.
+
+    The stored reduced potentials are rescaled to beta at ``temps[0]`` (the
+    thermostat temperature).  ``u_source_temperature`` is the temperature femto
+    scored them at; by default it is read from the run's ``run_meta.json``,
+    then ``chacra_run.json``, else femto's default 298.15 K is assumed.
     """
     from chacra.run_config import RunConfig
 
@@ -323,6 +399,19 @@ def build_occupancy_store(
     n_fr_u = u_state.shape[1]
     if verbose:
         print(f"  [reweight] {n_fr_u} saved frames x {K} states from {samples.name}")
+
+    # femto scored u with beta(u_source_temperature); the MD ran at temps[0].
+    if u_source_temperature is None:
+        u_source_temperature = hremd_source_temperature(project_dir, run, cfg, verbose)
+    u_source_temperature = float(u_source_temperature)
+    u_scale = u_source_temperature / float(temps[0])
+    if abs(u_scale - 1.0) > 1e-9:
+        u_state = u_state * u_scale
+        if verbose:
+            print(
+                f"  [reweight] rescaled reduced potentials by {u_scale:.5f} "
+                f"({u_source_temperature} K -> {float(temps[0])} K)"
+            )
 
     cdir = Path(contacts_dir) if contacts_dir else (
         project_dir / "contact_output" / f"run_{run}" / "contacts"
@@ -397,7 +486,9 @@ def build_occupancy_store(
     return OccupancyStore(
         phi=phi, u=u_state, contacts=contacts, lambdas=lambdas, temps=temps,
         meta={"run": int(run), "save_interval": int(save_interval),
-              "contact_source": mode, "n_frames": int(n_fr)},
+              "contact_source": mode, "n_frames": int(n_fr),
+              "u_temperature": float(temps[0]),
+              "u_source_temperature": u_source_temperature},
     )
 
 
@@ -406,12 +497,25 @@ def default_store_path(project_dir: str | os.PathLike, run: int) -> Path:
 
 
 def get_occupancy_store(
-    project_dir: str | os.PathLike, run: int, rebuild: bool = False, **kw
+    project_dir: str | os.PathLike,
+    run: int,
+    rebuild: bool = False,
+    legacy_u_temperature: float | None = LEGACY_U_TEMPERATURE,
+    **kw,
 ) -> OccupancyStore:
-    """Load the cached store for a run, building (and caching) it if needed."""
+    """
+    Load the cached store for a run, building (and caching) it if needed.
+
+    ``legacy_u_temperature`` applies to cached stores without temperature
+    metadata (see :meth:`OccupancyStore.load`); ``u_source_temperature`` in
+    ``kw`` applies when the store is built.
+    """
     path = default_store_path(project_dir, run)
     if path.exists() and not rebuild:
-        return OccupancyStore.load(path)
+        return OccupancyStore.load(
+            path, legacy_u_temperature=legacy_u_temperature,
+            verbose=kw.get("verbose", True),
+        )
     store = build_occupancy_store(project_dir, run, **kw)
     path.parent.mkdir(parents=True, exist_ok=True)
     store.save(path)
