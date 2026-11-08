@@ -44,6 +44,7 @@ from chacra.trajectories.process_hremd import (
     get_state_energies,
     strip_replica_trajectories,
     demux_state_trajectories,
+    verify_and_delete_full_dcds,
 )
 from chacra.plot import plot_chacras, plot_difference_of_roots, plot_explained_variance
 from chacra.convergence import (
@@ -54,7 +55,7 @@ from chacra.convergence import (
     plot_exchange_diagnostics,
 )
 from chacra.visualize.pymol import to_pymol
-from chacra.run_config import RunConfig
+from chacra.run_config import RunConfig, get_resources
 
 import MDAnalysis as mda
 
@@ -141,8 +142,14 @@ def _run_contacts(
     itypes: list[str],
     openmm_system: str | None,
     n_jobs: int,
+    stride: int = 1,
 ) -> None:
-    """Stage 3 worker: ultracontacts (GPU, parquet) or getcontacts (CPU, tsv)."""
+    """Stage 3 worker: ultracontacts (GPU, parquet) or getcontacts (CPU, tsv).
+
+    ``stride`` evaluates every Nth saved frame; ultracontacts stamps the
+    absolute frame index, which :func:`chacra.reweight.build_occupancy_store`
+    divides back out (``contact_stride``).
+    """
     n_gpus = _n_gpus()
     out_dir = f"contact_output/run_{run}/contacts"
     if n_gpus > 0:
@@ -156,7 +163,7 @@ def _run_contacts(
                     "--topology", topology,
                     "--trajectory", trajectories[r],
                     "--output", f"{out_dir}/cont_replica_{r}.parquet",
-                    "--stride", "1",
+                    "--stride", str(stride),
                     "--itypes", *itypes,
                 ]
                 if openmm_system and os.path.exists(openmm_system):
@@ -224,6 +231,14 @@ def main():
                              "not needed for the analysis).")
     parser.add_argument("--skip_convergence", action="store_true", default=False,
                         help="Skip the convergence report.")
+    parser.add_argument("--contact_stride", type=int, default=None,
+                        help="Evaluate contacts on every Nth saved frame (default: chacra_run.json "
+                             "value, else 1).  Changing it requires --force.")
+    parser.add_argument("--delete_full_trajectories", action="store_true", default=False,
+                        help="After the protein-only XTCs are verified against the DCD frame counts "
+                             "and samples.arrow, delete femto's full-system DCDs for this run "
+                             "(also honoured from chacra_run.json).  perturb-scan --generator energy "
+                             "needs the DCDs; keep them if you plan to use it.")
     # Legacy overrides — not required when chacra_run.json is present
     parser.add_argument("--min_temp", type=float, default=None)
     parser.add_argument("--max_temp", type=float, default=None)
@@ -261,7 +276,15 @@ def main():
         contact_itypes = contact_itypes.split()
     run_config.update(contact_itypes=" ".join(contact_itypes), save_interval=save_interval)
     openmm_sys = args.system_file or run_config.get("system_file")
-    n_jobs = args.n_jobs if args.n_jobs and args.n_jobs > 0 else None
+    # CPU workers: an explicit --n_jobs, else the CPUs this job may use
+    # (affinity mask under Slurm), never the node's full core count.
+    n_cpus = get_resources()["num_available"]
+    n_jobs = args.n_jobs if args.n_jobs and args.n_jobs > 0 else n_cpus
+    contact_stride = args.contact_stride if args.contact_stride else int(run_config.get("contact_stride") or 1)
+    if contact_stride < 1:
+        parser.error("--contact_stride must be >= 1")
+    run_config.update(contact_stride=contact_stride)
+    delete_full = args.delete_full_trajectories or bool(run_config.get("delete_full_trajectories"))
 
     # ---------------------------------------------------------------------- #
     # Directories / protein-only reference structure                          #
@@ -292,6 +315,19 @@ def main():
     stage3_done = not missing_contacts
     store_path = f"./contact_output/run_{run}/occupancy.npz"
     stage4_done = os.path.exists(store_path)
+    if stage4_done:
+        # a cached store built with another contact stride is stale
+        try:
+            import json as _json
+            with np.load(store_path, allow_pickle=True) as z:
+                _meta = _json.loads(str(z["meta"]))
+            if int(_meta.get("contact_stride", 1)) != contact_stride:
+                print(f"  [process-output] cached store has contact_stride "
+                      f"{_meta.get('contact_stride', 1)}, requested {contact_stride}: rebuilding "
+                      "(rerun contacts with --force if they were computed at another stride).")
+                stage4_done = False
+        except Exception:  # noqa: BLE001 — unreadable meta: rebuild
+            stage4_done = False
 
     cascade = args.force
     run1 = cascade or not stage1_done; cascade = cascade or run1
@@ -311,6 +347,12 @@ def main():
         print(f"  [DONE] {n_states} protein-only replica trajectories.")
     else:
         print(f"  [SKIP] all {n_states} present.")
+    if delete_full and any(os.path.exists(f"{rep_dir}/trajectories/r{i}.dcd") for i in range(n_states)):
+        print("  Verifying protein XTCs against the full-system DCDs before deleting the DCDs...")
+        verify_and_delete_full_dcds(
+            structure_file, f"{rep_dir}/trajectories", selection_file, protein_xtcs,
+            samples, save_interval,
+        )
 
     # ---------------------------------------------------------------------- #
     # Stage 2: exchange statistics                                            #
@@ -342,7 +384,7 @@ def main():
         if len(todo) < n_states:
             print(f"  [SKIP] {n_states - len(todo)}/{n_states} replicas already have contacts.")
         _run_contacts(run, todo, selection_file, protein_xtcs, contact_itypes,
-                      openmm_sys, args.n_jobs if args.n_jobs > 0 else os.cpu_count())
+                      openmm_sys, n_jobs, stride=contact_stride)
         still = [r for r in range(n_states) if _replica_contact_file(run, r) is None]
         if still:
             sys.exit(f"  [ERROR] contact files missing for replicas {still}; fix and rerun.")
@@ -358,7 +400,8 @@ def main():
 
     if run4:
         n_frames = len(mda.Universe(selection_file, protein_xtcs[0]).trajectory)
-        store = build_occupancy_store(".", run, save_interval=save_interval, n_frames=n_frames)
+        store = build_occupancy_store(".", run, save_interval=save_interval, n_frames=n_frames,
+                                      contact_stride=contact_stride)
         store.save(store_path)
         print(f"  [DONE] {store.n_states} states x {store.n_frames} frames x "
               f"{store.n_contacts} contacts → {store_path}")
@@ -391,7 +434,7 @@ def main():
     cdf = _accumulate_contacts(run, current_run_df)
     cdf.to_parquet(f"./analysis_output/run_{run}/total_contacts.parquet", index=True)
 
-    cf = ContactFrequencies(cdf, temps=np.round(temps), n_jobs=args.n_jobs)
+    cf = ContactFrequencies(cdf, temps=np.round(temps), n_jobs=n_jobs)
     top_ten = {pc: cf.cpca.sorted_norm_loadings(pc)[f"PC{pc}"][:10].index.tolist()
                for pc in cf.cpca.top_chacras}
     pd.DataFrame(top_ten).to_csv(f"./analysis_output/run_{run}/top_chacra_contacts.csv", index=False)
@@ -420,7 +463,7 @@ def main():
         report = convergence_report(
             run=run, n_states=n_states, exchange_probs=exchange_probs,
             k=len(cf.cpca.top_chacras) if cf.cpca.top_chacras else 3,
-            max_frames_per_state=5000, n_jobs=args.n_jobs,
+            max_frames_per_state=5000, n_jobs=n_jobs,
         )
         save_convergence_report(report, f"./analysis_output/run_{run}")
         print_convergence_report(report)

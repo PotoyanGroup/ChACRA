@@ -431,3 +431,30 @@ def barostat_temperature_from_xml(system_file: str) -> float | None:
             if t:
                 return float(t.group(1))
     return None
+
+
+def hydrogen_mass_from_xml(system_file: str) -> float | None:
+    """
+    Repartitioned hydrogen mass (amu) of an OpenMM system XML, or None when the
+    system has no hydrogen mass repartitioning (HMR).
+
+    OpenMM's ``hydrogenMass`` moves mass onto every hydrogen bound to a heavy
+    atom except water, so an HMR system has a population of particles at the
+    chosen mass (1.5-4.5 amu) beside water's 1.008 amu.  The most common mass
+    in that window is returned.
+    """
+    import re
+    from collections import Counter
+
+    counts: Counter = Counter()
+    with open(system_file) as fh:
+        for line in fh:
+            if "<Particle" not in line:
+                continue
+            for m in re.finditer(r'<Particle mass="([0-9.eE+-]+)"', line):
+                mass = float(m.group(1))
+                if 1.2 <= mass <= 4.5:
+                    counts[round(mass, 3)] += 1
+    if not counts:
+        return None
+    return float(counts.most_common(1)[0][0])

@@ -405,6 +405,7 @@ def build_occupancy_store(
     n_frames: int | None = None,
     verbose: bool = True,
     u_source_temperature: float | None = None,
+    contact_stride: int = 1,
 ) -> OccupancyStore:
     """
     Build an :class:`OccupancyStore` for ``run`` of a ChACRA project.
@@ -418,6 +419,10 @@ def build_occupancy_store(
     ``n_frames`` (the replica trajectory length) is authoritative when given;
     otherwise the frame count is inferred from the contact files and must
     agree with the number of saved energy rows to within 5%.
+
+    ``contact_stride`` > 1 means the contact files hold every Nth saved frame
+    (ultracontacts ``--stride N`` stamps absolute frame indices); the reduced
+    potentials and exchange record are strided to match.
 
     The stored reduced potentials are rescaled to beta at ``temps[0]`` (the
     thermostat temperature).  ``u_source_temperature`` is the temperature femto
@@ -455,9 +460,14 @@ def build_occupancy_store(
     if not samples.exists():
         raise FileNotFoundError(samples)
     u_state, r2s = load_femto_reduced_potentials(samples, save_interval)
+    contact_stride = int(contact_stride or 1)
+    if contact_stride > 1:
+        u_state = u_state[:, ::contact_stride]
+        r2s = r2s[::contact_stride]
     n_fr_u = u_state.shape[1]
     if verbose:
-        print(f"  [reweight] {n_fr_u} saved frames x {K} states from {samples.name}")
+        print(f"  [reweight] {n_fr_u} saved frames x {K} states from {samples.name}"
+              + (f" (contact stride {contact_stride})" if contact_stride > 1 else ""))
 
     # femto scored u with beta(u_source_temperature); the MD ran at temps[0].
     if u_source_temperature is None:
@@ -502,6 +512,9 @@ def build_occupancy_store(
     n_fr_c = 0
     for p in files:
         frames, uniq, inv = _residue_pairs(p)
+        if contact_stride > 1:
+            keep = frames % contact_stride == 0
+            frames, inv = frames[keep] // contact_stride, inv[keep]
         raw.append((frames, uniq, inv))
         contact_set.update(uniq.tolist())
         n_fr_c = max(n_fr_c, int(frames.max()) + 1 if len(frames) else 0)
@@ -511,7 +524,7 @@ def build_occupancy_store(
     cidx = {c: i for i, c in enumerate(contacts)}
 
     if n_frames is not None:
-        n_fr = int(n_frames)
+        n_fr = int(np.ceil(int(n_frames) / contact_stride))
         if n_fr_u < n_fr:
             raise ValueError(
                 f"trajectory has {n_fr} frames but only {n_fr_u} saved energy rows "
@@ -545,6 +558,7 @@ def build_occupancy_store(
     return OccupancyStore(
         phi=phi, u=u_state, contacts=contacts, lambdas=lambdas, temps=temps,
         meta={"run": int(run), "save_interval": int(save_interval),
+              "contact_stride": int(contact_stride),
               "contact_source": mode, "n_frames": int(n_fr),
               "u_temperature": float(temps[0]),
               "u_source_temperature": u_source_temperature},

@@ -184,7 +184,54 @@ class TestFemtoTemperatureCorrection:
         np.testing.assert_allclose(again.u, store.u)
 
 
+class TestContactStride:
+    def test_strided_contacts_divide_frame_indices(self, project):
+        # the fixture's contact files hold even frames only; read them as the
+        # output of `ultracontacts --stride 2` (absolute frame indices)
+        root, r2s_saved, lam = project
+        full = build_occupancy_store(root, run=1, n_frames=N_FR, verbose=False)
+        strided = build_occupancy_store(root, run=1, n_frames=N_FR, verbose=False, contact_stride=2)
+        assert strided.n_frames == N_FR // 2
+        assert strided.meta["contact_stride"] == 2
+        np.testing.assert_allclose(strided.u, full.u[:, ::2])
+        # every strided frame carries its replica's contact: per-state sums are 1
+        np.testing.assert_allclose(strided.freqs().to_numpy().sum(axis=1), 1.0)
+        np.testing.assert_array_equal(strided.phi, full.phi[:, ::2])
+
+
 class TestConvergenceFromStore:
+    def test_dense_block_path_matches_frame_path(self, project, tmp_path):
+        from chacra.convergence import (
+            _block_sums_from_stores,
+            _freqs_from_blocks,
+            _load_all_states_from_stores,
+            _build_freq_matrix,
+            bootstrap_loadings_dense,
+            split_half_rmsip_dense,
+        )
+
+        root, _, _ = project
+        store = build_occupancy_store(root, run=1, n_frames=N_FR, verbose=False)
+        cdir = tmp_path / "contact_output" / "run_1"   # the fixture's own run dir
+        cdir.mkdir(parents=True, exist_ok=True)
+        p = cdir / "occupancy.npz"
+        store.save(p)
+        sums, sizes, contacts = _block_sums_from_stores([p], K, block=1)
+        assert contacts == store.contacts
+        freqs = _freqs_from_blocks(sums, sizes)
+        np.testing.assert_allclose(freqs, store.freqs().to_numpy())
+        # block=1 split-half equals the per-frame split
+        states = _load_all_states_from_stores([p], K)
+        halves = [sc.frames[: len(sc.frames) // 2] for sc in states]
+        ref = _build_freq_matrix(states, halves).reindex(columns=contacts, fill_value=0.0).to_numpy()
+        wa = [np.r_[np.ones(len(n) // 2), np.zeros(len(n) - len(n) // 2)] for n in sizes]
+        np.testing.assert_allclose(_freqs_from_blocks(sums, sizes, wa), ref)
+        val = split_half_rmsip_dense([p], K, k=2, block=1)
+        assert 0.0 <= val <= 1.0
+        boot = bootstrap_loadings_dense([p], K, k=2, n_top=2, n_bootstrap=5, block=2)
+        assert set(boot.index) == set(contacts)
+        assert ((boot >= 0) & (boot <= 1)).all().all()
+
     def test_state_contacts_from_store(self, project, tmp_path):
         from chacra.convergence import _load_all_states_from_stores
 
@@ -264,3 +311,47 @@ class TestStripAndDemux:
                 d_out = np.linalg.norm(ts.positions[0] - ts.positions[1])
                 d_ref = np.linalg.norm(coords[r][j][0] - coords[r][j][1])
                 assert d_out == pytest.approx(d_ref, abs=1e-2)
+
+    def test_verify_and_delete_full_dcds(self, tiny_system, tmp_path):
+        import json
+
+        import MDAnalysis as mda
+        from chacra.trajectories.process_hremd import (
+            strip_replica_trajectories, verify_and_delete_full_dcds,
+        )
+
+        pdb, traj_dir, coords, n_prot = tiny_system
+        protein_dir = tmp_path / "protein"
+        xtcs = strip_replica_trajectories(pdb, traj_dir, protein_dir, K,
+                                          selection="resname ALA", n_jobs=1)
+        prot_pdb = tmp_path / "protein.pdb"
+        mda.Universe(str(pdb)).select_atoms("resname ALA").write(str(prot_pdb))
+        # one saved frame per cycle, N_FR cycles from cycle 0
+        rng = np.random.default_rng(3)
+        r2s = np.array([rng.permutation(K) for _ in range(N_FR)])
+        u = np.zeros((N_FR, K, K))
+        samples = tmp_path / "samples.arrow"
+        _write_samples_arrow(samples, 0, N_FR, r2s, u)
+
+        # wrong save_interval -> expected frames differ -> nothing deleted
+        rep = verify_and_delete_full_dcds(pdb, traj_dir, prot_pdb, xtcs, samples, save_interval=2)
+        assert all(e["status"] == "kept" for e in rep["replicas"].values())
+        assert all((traj_dir / f"r{r}.dcd").exists() for r in range(K))
+        assert not (traj_dir / "FULL_DCD_DELETED.json").exists()
+
+        # dry run reports but keeps
+        rep = verify_and_delete_full_dcds(pdb, traj_dir, prot_pdb, xtcs, samples, save_interval=1,
+                                          dry_run=True)
+        assert all(e["status"] == "would_delete" for e in rep["replicas"].values())
+        assert all((traj_dir / f"r{r}.dcd").exists() for r in range(K))
+
+        # matching counts -> deleted, with a record
+        rep = verify_and_delete_full_dcds(pdb, traj_dir, prot_pdb, xtcs, samples, save_interval=1)
+        assert all(e["status"] == "deleted" for e in rep["replicas"].values())
+        assert not any((traj_dir / f"r{r}.dcd").exists() for r in range(K))
+        assert rep["bytes_freed"] > 0
+        rec = json.load(open(traj_dir / "FULL_DCD_DELETED.json"))
+        assert rec["expected_frames"] == N_FR and len(rec["replicas"]) == K
+        # the protein XTCs are untouched
+        for x in xtcs:
+            assert len(mda.Universe(str(prot_pdb), x).trajectory) == N_FR

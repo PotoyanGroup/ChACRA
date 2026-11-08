@@ -91,7 +91,7 @@ def _run_mbar(args, project: Path, out_dir: Path, store, runs, tag):
 
     est = ResponseEstimator(store)
     print(f"[chacra response] REST2 decomposition residual: {est.fit_residual:.2e} "
-          f"(should be ~1e-6; large values mean the Hamiltonian is not a + b*lam + c*sqrt(lam))")
+          f"(femto REST2 output: ~1e-3 kT or less; large values mean the Hamiltonian is not a + b*lam + c*sqrt(lam))")
     print(f"[chacra response] MBAR f_k (kT): {np.round(est.f_k, 1).tolist()}")
 
     lambdas = (

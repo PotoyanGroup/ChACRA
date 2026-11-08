@@ -345,6 +345,132 @@ def _load_all_states_from_stores(
     return out
 
 
+def _store_paths(contact_base: str) -> list:
+    """Per-run occupancy stores under ``contact_base``, in run order."""
+    return sorted(Path(contact_base).glob("run_*/occupancy.npz"),
+                  key=lambda p: int(p.parent.name.split("_")[1]))
+
+
+def _block_sums_from_stores(
+    store_paths: list, n_states: int, block: int = 50,
+    max_frames_per_state: int | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[str]]:
+    """
+    Per-state block sums of contact occupancy from one or more occupancy
+    stores: for every state, a ``(n_blocks, C)`` float64 array of summed
+    occupancies over ``block`` consecutive frames and the matching block
+    sizes.  Runs are concatenated per state (a block never spans two runs).
+    Memory is ~n_blocks x C per state instead of per-frame data, and every
+    split-half or bootstrap frequency is one matrix product.
+
+    ``max_frames_per_state`` thins the blocks evenly to that many frames.
+    """
+    from chacra.reweight import OccupancyStore
+
+    contacts: list[str] = []
+    cidx: dict[str, int] = {}
+    per_state_sums: list[list[np.ndarray]] = [[] for _ in range(n_states)]
+    per_state_sizes: list[list[np.ndarray]] = [[] for _ in range(n_states)]
+    for path in store_paths:
+        store = OccupancyStore.load(path, verbose=False)
+        if store.n_states != n_states:
+            raise ValueError(f"{path}: {store.n_states} states, expected {n_states}")
+        new = [c for c in store.contacts if c not in cidx]
+        for c in new:
+            cidx[c] = len(contacts)
+            contacts.append(c)
+        cols = np.array([cidx[c] for c in store.contacts], dtype=int)
+        n_fr = store.n_frames
+        n_full = n_fr // block
+        sizes = np.full(n_full + (1 if n_fr % block else 0), block, dtype=np.int64)
+        if n_fr % block:
+            sizes[-1] = n_fr % block
+        for s in range(n_states):
+            phi = store.phi[s]
+            sums = np.zeros((len(sizes), len(contacts)), dtype=np.float64)
+            if n_full:
+                sums[:n_full, cols] = phi[:n_full * block].reshape(n_full, block, -1).sum(axis=1)
+            if n_fr % block:
+                sums[-1, cols] = phi[n_full * block:].sum(axis=0)
+            per_state_sums[s].append(sums)
+            per_state_sizes[s].append(sizes)
+        del store
+    C = len(contacts)
+    out_sums, out_sizes = [], []
+    for s in range(n_states):
+        # earlier runs may have fewer columns: pad to the final contact set
+        padded = [np.pad(a, ((0, 0), (0, C - a.shape[1]))) for a in per_state_sums[s]]
+        sums = np.concatenate(padded, axis=0)
+        sizes = np.concatenate(per_state_sizes[s])
+        if max_frames_per_state and sizes.sum() > max_frames_per_state:
+            keep = max(2, int(round(len(sizes) * max_frames_per_state / sizes.sum())))
+            idx = np.linspace(0, len(sizes) - 1, keep, dtype=int)
+            sums, sizes = sums[idx], sizes[idx]
+        out_sums.append(sums)
+        out_sizes.append(sizes)
+    return out_sums, out_sizes, contacts
+
+
+def _freqs_from_blocks(sums: list[np.ndarray], sizes: list[np.ndarray],
+                       weights: list[np.ndarray] | None = None) -> np.ndarray:
+    """(n_states, C) frequencies from block sums, optionally with per-block multiplicities."""
+    rows = []
+    for s, (a, n) in enumerate(zip(sums, sizes)):
+        w = weights[s] if weights is not None else np.ones(len(n))
+        rows.append((w @ a) / max(float(w @ n), 1.0))
+    return np.vstack(rows)
+
+
+def split_half_rmsip_dense(store_paths: list, n_states: int, k: int = 3,
+                           block: int = 50, max_frames_per_state: int | None = None) -> float:
+    """Split-half RMSIP from occupancy stores: first half of the blocks vs the second."""
+    sums, sizes, contacts = _block_sums_from_stores(store_paths, n_states, block, max_frames_per_state)
+    if min(len(n) for n in sizes) < 2:
+        return float("nan")
+    wa = [np.r_[np.ones(len(n) // 2), np.zeros(len(n) - len(n) // 2)] for n in sizes]
+    wb = [1.0 - w for w in wa]
+    fa = pd.DataFrame(_freqs_from_blocks(sums, sizes, wa), columns=contacts)
+    fb = pd.DataFrame(_freqs_from_blocks(sums, sizes, wb), columns=contacts)
+    k_eff = min(k, fa.shape[0], fa.shape[1])
+    if k_eff < k:
+        print(f"  [rmsip] Warning: comparing top {k_eff} PCs instead of {k}.")
+    return rmsip(_fit_pca_loadings(fa), _fit_pca_loadings(fb), k_eff)
+
+
+def bootstrap_loadings_dense(store_paths: list, n_states: int, k: int = 3, n_top: int = 20,
+                             n_bootstrap: int = 100, block: int = 50,
+                             max_frames_per_state: int | None = None, seed: int = 42) -> pd.DataFrame:
+    """
+    Block-bootstrap rank stability of the PC loadings from occupancy stores.
+
+    Each iteration draws block multiplicities (multinomial over the blocks of
+    every state), forms the frequency matrix with one matrix product per
+    state, fits PCA and records which contacts are in the top ``n_top`` of
+    each PC.  Blocks of consecutive frames respect the frames' autocorrelation
+    better than resampling single frames.
+    """
+    sums, sizes, contacts = _block_sums_from_stores(store_paths, n_states, block, max_frames_per_state)
+    rng = np.random.default_rng(seed)
+    counts = {f"PC{pc}_rank_freq": pd.Series(0.0, index=contacts) for pc in range(1, k + 1)}
+    done = 0
+    for _ in range(n_bootstrap):
+        w = [rng.multinomial(len(n), np.full(len(n), 1.0 / len(n))).astype(float) for n in sizes]
+        df = pd.DataFrame(_freqs_from_blocks(sums, sizes, w), columns=contacts)
+        if df.shape[1] < k:
+            continue
+        pca = PCA(n_components=min(k, df.shape[0], df.shape[1]))
+        pca.fit(df)
+        loadings = pd.DataFrame(pca.components_.T, index=contacts,
+                                columns=[f"PC{i+1}" for i in range(pca.n_components_)])
+        for pc in range(1, pca.n_components_ + 1):
+            top = loadings[f"PC{pc}"].abs().nlargest(n_top).index
+            counts[f"PC{pc}_rank_freq"][top] += 1
+        done += 1
+    result = pd.DataFrame(counts) / max(done, 1)
+    result["max_freq"] = result.max(axis=1)
+    return result.sort_values("max_freq", ascending=False).drop(columns="max_freq")
+
+
 def _load_state_worker(args: tuple) -> _StateContacts:
     """Multiprocessing wrapper for _load_state_contacts."""
     state_idx, contact_base, file_pattern = args
@@ -507,6 +633,14 @@ def split_half_rmsip(
     """
     if n_jobs is None or n_jobs <= 0:
         n_jobs = cpu_count()
+
+    # Occupancy stores: block sums and one matrix product per half.
+    if file_pattern is None:
+        stores = _store_paths(contact_base)
+        if stores:
+            print(f"  [rmsip] split-half from {len(stores)} occupancy store(s) (block sums)")
+            return split_half_rmsip_dense(stores, n_states, k=k,
+                                          max_frames_per_state=max_frames_per_state)
 
     # Phase 1: Load per-frame data for all states.
     state_data = _load_all_states(n_states, contact_base, file_pattern, n_jobs)
@@ -757,6 +891,16 @@ def bootstrap_loadings(
     """
     if n_jobs is None or n_jobs <= 0:
         n_jobs = cpu_count()
+
+    # Occupancy stores: block bootstrap on block sums (seconds, not minutes).
+    if file_pattern is None:
+        stores = _store_paths(contact_base)
+        if stores:
+            print(f"  [bootstrap] {n_bootstrap} block-bootstrap iterations from "
+                  f"{len(stores)} occupancy store(s)")
+            return bootstrap_loadings_dense(stores, n_states, k=k, n_top=n_top,
+                                            n_bootstrap=n_bootstrap,
+                                            max_frames_per_state=max_frames_per_state)
 
     # Phase 1: Load all contact data
     print("  [bootstrap] Loading per-frame contact data...")

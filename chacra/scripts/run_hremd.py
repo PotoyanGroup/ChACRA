@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import shutil
 import subprocess
 import traceback
@@ -155,6 +156,30 @@ def main():
     )
 
     parser.add_argument(
+        "--delete_full_trajectories",
+        action="store_true",
+        default=None,
+        dest="delete_full_trajectories",
+        help="After process-output has stripped the protein-only XTCs and "
+             "verified their frame counts, delete femto's full-system DCDs "
+             "(~95%% of a run's disk).  Remembered in chacra_run.json.  Keep the "
+             "DCDs if you need perturb-scan --generator energy.",
+    )
+    parser.add_argument(
+        "--contact_stride",
+        type=int,
+        default=None,
+        dest="contact_stride",
+        help="Evaluate contacts on every Nth saved frame (default 1).",
+    )
+    parser.add_argument(
+        "--force_timestep",
+        action="store_true",
+        default=False,
+        help="Run a timestep > 2 fs even when the system XML shows no hydrogen "
+             "mass repartitioning.",
+    )
+    parser.add_argument(
         "--hremd_temperature",
         type=float,
         default=None,
@@ -197,9 +222,32 @@ def main():
         "timestep": 2,
         "mps_replicas": 1,
     }
+    # timestep: the config remembers what make-simulation built (hmass, timestep);
+    # 4 fs is only safe with hydrogen mass repartitioning.
+    if args.timestep is None and run_config.get("hmass") is not None:
+        args.timestep = 4 if float(run_config.get("hmass")) >= 3.0 else 2
     for key, val in _hard_defaults.items():
         if getattr(args, key, None) is None:
             setattr(args, key, val)
+    if args.delete_full_trajectories is None:
+        args.delete_full_trajectories = bool(run_config.get("delete_full_trajectories"))
+    if args.contact_stride is None:
+        args.contact_stride = int(run_config.get("contact_stride") or 1)
+    if args.timestep > 2 and not args.force_timestep:
+        from chacra.simulation import hydrogen_mass_from_xml
+
+        try:
+            h_mass = hydrogen_mass_from_xml(args.system_file)
+        except OSError:
+            h_mass = None
+        if h_mass is None:
+            sys.exit(
+                f"run-hremd: --timestep {args.timestep} fs but {args.system_file} shows no "
+                "hydrogen mass repartitioning (no particles between 1.2 and 4.5 amu).  "
+                "Rebuild with `chacra make-simulation --hmass 3`, use --timestep 2, or "
+                "pass --force_timestep."
+            )
+        print(f"Hydrogen mass repartitioning detected ({h_mass} amu); timestep {args.timestep} fs.")
 
     # Validate required args
     if args.system_file is None:
@@ -461,6 +509,8 @@ def main():
         mps_replicas=args.mps_replicas,
         mpi_command=args.mpi_command,
         hremd_temperature=hremd_temperature,
+        contact_stride=args.contact_stride,
+        delete_full_trajectories=bool(args.delete_full_trajectories),
         current_run=current_run,
     )
     # Remove legacy key if present
@@ -548,21 +598,25 @@ def main():
 
         # Process the replicas to state trajectories and run analyses.
         # Pass --config so process-output reads temps/n_systems from JSON.
+        # process-output picks its own CPU worker count (the job's affinity
+        # mask), not the GPU count; --n_jobs here used to throttle it to n_gpus.
         analysis_command = [
             "chacra", "process-output",
             "--run",
             str(current_run),
-            "--n_jobs",
-            str(args.n_jobs),
             "--structure_file",
             args.structure_file,
             "--save_interval",
             str(args.save_interval),
             "--output_selection",
             args.output_selection,
+            "--contact_stride",
+            str(args.contact_stride),
             "--config",
             _CONFIG_PATH,
         ]
+        if args.delete_full_trajectories:
+            analysis_command.append("--delete_full_trajectories")
         subprocess.run(analysis_command, check=False)
 
         # Update current_run in JSON after successful completion

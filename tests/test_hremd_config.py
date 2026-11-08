@@ -78,3 +78,28 @@ def test_barostat_temperature_from_xml(tmp_path):
     assert barostat_temperature_from_xml(str(xml)) == pytest.approx(290.0)
     xml.write_text('<System><Forces><Force type="NonbondedForce"/></Forces></System>')
     assert barostat_temperature_from_xml(str(xml)) is None
+
+
+def test_hydrogen_mass_from_xml(tmp_path):
+    from chacra.simulation import hydrogen_mass_from_xml
+
+    xml = tmp_path / "system.xml"
+    particles = ['<Particle mass="1.007947"/>'] * 20 + ['<Particle mass="2"/>'] * 5 + \
+                ['<Particle mass="11.018"/>'] * 5 + ['<Particle mass="15.99943"/>'] * 10
+    xml.write_text("<System><Particles>" + "".join(particles) + "</Particles></System>")
+    assert hydrogen_mass_from_xml(str(xml)) == pytest.approx(2.0)
+    xml.write_text("<System><Particles>" + "".join(['<Particle mass="1.007947"/>'] * 20 +
+                   ['<Particle mass="12.01"/>'] * 5) + "</Particles></System>")
+    assert hydrogen_mass_from_xml(str(xml)) is None
+
+
+def test_get_resources_is_cgroup_aware():
+    import os
+
+    from chacra.run_config import get_resources
+
+    r = get_resources()
+    assert r["num_available"] >= 1
+    assert 1 <= r["num_cores"] <= r["num_available"]
+    if hasattr(os, "sched_getaffinity"):
+        assert r["num_available"] == len(os.sched_getaffinity(0))

@@ -21,9 +21,18 @@ def get_resources() -> dict:
     dict with keys:
         num_cores, num_threads, total_ram_gb, available_ram_gb, available_ram_mb
     """
+    # Under Slurm (or any cgroup) the job sees only its allotted CPUs; psutil
+    # counts the whole node.  Prefer the affinity mask when the OS has one.
+    try:
+        n_avail = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n_avail = None
+    physical = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or 1
+    logical = psutil.cpu_count(logical=True) or physical
     return {
-        "num_cores": psutil.cpu_count(logical=False),   # physical cores
-        "num_threads": psutil.cpu_count(logical=True),  # includes hyperthreads
+        "num_cores": min(n_avail, physical) if n_avail else physical,
+        "num_threads": min(n_avail, logical) if n_avail else logical,
+        "num_available": n_avail if n_avail else logical,
         "total_ram_gb": psutil.virtual_memory().total / 1e9,
         "available_ram_gb": psutil.virtual_memory().available / 1e9,
         "available_ram_mb": psutil.virtual_memory().available / 1e6,
@@ -76,6 +85,10 @@ class RunConfig:
         "timestep": 2,
         "current_run": 0,
         "mps_replicas": 1,
+        "hremd_temperature": None,       # beta for femto's reduced potentials; min_temp on new projects
+        "hmass": None,                   # hydrogen mass (amu) make-simulation built the system with
+        "contact_stride": 1,             # frames between contact evaluations (on top of save_interval)
+        "delete_full_trajectories": False,  # remove femto's full-system DCDs after a verified strip
     }
 
     def __init__(self, config_file: str | None = None):

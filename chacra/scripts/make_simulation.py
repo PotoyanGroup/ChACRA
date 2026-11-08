@@ -58,7 +58,9 @@ def main():
     parser.add_argument(
         "-d", "--timestep", type=int, required=False,
         help="""
-        Timestep in femtoseconds."
+        Timestep in femtoseconds for the HREMD (recorded in chacra_run.json and
+        used by run-hremd unless overridden).  4 fs needs hydrogen mass
+        repartitioning (--hmass >= 3); use 2 fs otherwise.
         """,
         default=4
     )
@@ -66,9 +68,11 @@ def main():
     parser.add_argument(
         "-m", "--hmass", type=float, required=False,
         help="""
-        Hydrogen mass. A larger hydrogen mass allows a longer timestep."
+        Hydrogen mass in amu (hydrogen mass repartitioning; water is left
+        alone).  3 amu supports a 4 fs timestep with HBonds constraints; 1.008
+        means no repartitioning and a 2 fs timestep.
         """,
-        default=1.5
+        default=3.0
     )
 
     parser.add_argument(
@@ -82,6 +86,11 @@ def main():
     args = parser.parse_args()
     pressure = float(args.pressure)
     temperature = float(args.temperature)
+    if args.timestep > 2 and args.hmass < 3.0:
+        parser.error(
+            f"--timestep {args.timestep} fs needs hydrogen mass repartitioning "
+            f"(--hmass >= 3); got --hmass {args.hmass}.  Use --timestep 2 or --hmass 3."
+        )
 
     if args.fix:
         print("Running pdbfixer.")
@@ -106,6 +115,22 @@ def main():
     print("Minimizing the system.")
     setup.make_simulation()
     setup.save(args.output)
+
+    # Record how the system was built so run-hremd can pick a consistent timestep.
+    from chacra.run_config import RunConfig
+
+    cfg_path = os.path.join(args.output, "chacra_run.json")
+    cfg = RunConfig(cfg_path if os.path.exists(cfg_path) else None)
+    cfg.update(
+        system_file=os.path.join("system", f"{args.name}_system.xml"),
+        structure_file=os.path.join("structures", f"{args.name}_minimized.pdb"),
+        min_temp=temperature,
+        hmass=float(args.hmass),
+        timestep=int(args.timestep),
+    )
+    cfg.write(cfg_path)
+    print(f"Recorded system_file, structure_file, min_temp, hmass={args.hmass}, "
+          f"timestep={args.timestep} in {cfg_path}")
 
 if __name__ == "__main__":
     main()

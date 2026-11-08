@@ -718,6 +718,81 @@ def strip_replica_trajectories(
     return outputs
 
 
+def _count_frames(topology: str | os.PathLike, trajectory: str | os.PathLike) -> int:
+    return len(mda.Universe(str(topology), str(trajectory)).trajectory)
+
+
+def verify_and_delete_full_dcds(
+    structure: str | os.PathLike,
+    traj_dir: str | os.PathLike,
+    protein_pdb: str | os.PathLike,
+    protein_xtcs: list[str],
+    samples_arrow: str | os.PathLike,
+    save_interval: int,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Delete femto's full-system ``r{i}.dcd`` files once the protein-only XTCs
+    are verified, and record what was removed in ``traj_dir/FULL_DCD_DELETED.json``.
+
+    A replica's DCD is removed only if its XTC has exactly as many frames as
+    the DCD and the DCD frame count is within one frame of the number of saved
+    frames implied by ``samples.arrow`` and ``save_interval``.  Nothing else
+    reads the DCDs: femto's resume works without them once a run has been
+    moved into ``replica_trajectories/run_N`` (the next run starts a fresh
+    ``hremd-outputs/trajectories``), and only ``perturb-scan --generator energy``
+    needs full-system coordinates.
+
+    Returns a summary dict (also written to the JSON when files are deleted).
+    """
+    import json
+    from datetime import datetime
+
+    traj_dir = Path(traj_dir)
+    df = load_femto_data(str(samples_arrow))
+    expected = int(len(saved_frame_rows(df, save_interval)))
+    report = {
+        "written": datetime.now().isoformat(timespec="seconds"),
+        "save_interval": int(save_interval),
+        "expected_frames": expected,
+        "rule": "deleted iff xtc_frames == dcd_frames and |dcd_frames - expected| <= 1",
+        "replicas": {},
+        "bytes_freed": 0,
+        "dry_run": bool(dry_run),
+    }
+    for i, xtc in enumerate(protein_xtcs):
+        dcd = traj_dir / f"r{i}.dcd"
+        if not dcd.exists():
+            report["replicas"][i] = {"status": "no_dcd"}
+            continue
+        if not os.path.exists(xtc):
+            report["replicas"][i] = {"status": "kept", "reason": "protein xtc missing"}
+            continue
+        n_dcd = _count_frames(structure, dcd)
+        n_xtc = _count_frames(protein_pdb, xtc)
+        entry = {"dcd_frames": n_dcd, "xtc_frames": n_xtc, "bytes": dcd.stat().st_size}
+        if n_xtc == n_dcd and abs(n_dcd - expected) <= 1:
+            if not dry_run:
+                dcd.unlink()
+            entry["status"] = "deleted" if not dry_run else "would_delete"
+            report["bytes_freed"] += entry["bytes"]
+        else:
+            entry["status"] = "kept"
+            entry["reason"] = (
+                f"frame mismatch: dcd {n_dcd}, xtc {n_xtc}, expected {expected}"
+            )
+        report["replicas"][i] = entry
+        print(f"  [full-dcd] replica {i}: {entry['status']} "
+              f"(dcd {n_dcd}, xtc {n_xtc}, expected {expected})")
+    n_deleted = sum(1 for e in report["replicas"].values() if e.get("status") == "deleted")
+    if n_deleted and not dry_run:
+        with open(traj_dir / "FULL_DCD_DELETED.json", "w") as fh:
+            json.dump(report, fh, indent=2)
+        print(f"  [full-dcd] deleted {n_deleted} DCDs, freed {report['bytes_freed'] / 1e9:.1f} GB; "
+              f"record in {traj_dir / 'FULL_DCD_DELETED.json'}")
+    return report
+
+
 def _demux_worker(args: tuple) -> tuple[int, int]:
     state, protein_pdb, replica_xtcs, r2s, out_path, ref_path = args
     universes = [mda.Universe(protein_pdb, x) for x in replica_xtcs]
