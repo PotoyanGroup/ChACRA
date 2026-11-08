@@ -191,3 +191,91 @@ def test_pc_frame_fraction():
     out = pc_frame(v, L, n_pcs=3)
     assert out["frac_in_pc1_3"] == pytest.approx(2.0 / 6.0)
     assert out["cos_pc1"] == pytest.approx(1 / np.sqrt(6))
+
+
+class TestSingleStateAndPooling:
+    def test_single_state_response_matches_estimator_and_analytic(self):
+        from chacra.reweight import single_state_response
+
+        store, thresholds = _make_store(n_frames=40000, seed=5)
+        k = 2
+        lam = store.lambdas[k]
+        r = single_state_response(store, k, n_boot=5, block=100)
+        e = ResponseEstimator(store, use_pymbar=False).single_state(k)
+        np.testing.assert_allclose(r.R1, e.R1, atol=1e-10)
+        np.testing.assert_allclose(r.R2, e.R2, atol=1e-10)
+        np.testing.assert_allclose(r.phi_mean, e.phi_mean, atol=1e-10)
+        h = 1e-3
+        analytic = (_phi_mean_analytic(lam + h, thresholds) - _phi_mean_analytic(lam - h, thresholds)) / (2 * h)
+        np.testing.assert_allclose(r.phi_mean, _phi_mean_analytic(lam, thresholds), atol=0.01)
+        np.testing.assert_allclose(r.R1, analytic, atol=0.05)
+        assert r.R1_err.shape == r.R1.shape and np.all(r.R1_err >= 0)
+        assert r.R2_err.shape == r.R2.shape
+        assert r.lam == pytest.approx(lam) and r.ess == store.n_frames
+
+    def test_single_state_rejects_bad_state(self):
+        from chacra.reweight import single_state_response
+
+        store, _ = _make_store(n_frames=200)
+        with pytest.raises(IndexError):
+            single_state_response(store, store.n_states)
+
+    def test_ladder_slope_module_function_matches_method(self):
+        from chacra.reweight import ladder_slope
+
+        store, _ = _make_store(n_frames=2000, seed=8)
+        e = ResponseEstimator(store, use_pymbar=False)
+        for k in range(store.n_states):
+            np.testing.assert_allclose(ladder_slope(store, k), e.ladder_slope(k))
+
+    def test_concat_union_frames_and_pooled_estimate(self):
+        s1, thresholds = _make_store(n_frames=3000, seed=6)
+        s2, _ = _make_store(n_frames=2000, seed=7)
+        # second run lacks the last contact -> union with zero-fill
+        s2b = OccupancyStore(phi=s2.phi[:, :, :-1], u=s2.u, contacts=s2.contacts[:-1],
+                             lambdas=s2.lambdas, temps=s2.temps, meta=dict(s2.meta, run=2))
+        s1.meta["run"] = 1
+        pooled = OccupancyStore.concat([s1, s2b])
+        assert pooled.contacts == s1.contacts
+        assert pooled.n_frames == 5000 and pooled.n_states == s1.n_states
+        assert pooled.meta["segments"] == [0, 3000, 5000]
+        assert pooled.meta["runs"] == [1, 2]
+        f1, f2, fp = s1.freqs().to_numpy(), s2b.freqs().to_numpy(), pooled.freqs().to_numpy()
+        np.testing.assert_allclose(fp[:, :-1], (3000 * f1[:, :-1] + 2000 * f2) / 5000)
+        np.testing.assert_allclose(fp[:, -1], 3000 * f1[:, -1] / 5000)
+        np.testing.assert_allclose(pooled.u[:, :3000], s1.u)
+        np.testing.assert_allclose(pooled.u[:, 3000:], s2b.u)
+        # the pooled MBAR estimate of the shared contacts is still right
+        e = ResponseEstimator(pooled, use_pymbar=False)
+        lam = 0.75
+        h = 1e-3
+        analytic = (_phi_mean_analytic(lam + h, thresholds) - _phi_mean_analytic(lam - h, thresholds)) / (2 * h)
+        r = e.at(lam)
+        np.testing.assert_allclose(r.R1[:-1], analytic[:-1], atol=0.06)
+
+    def test_concat_rejects_mismatched_ladders_or_temperatures(self):
+        s1, _ = _make_store(n_frames=100)
+        s2, _ = _make_store(n_frames=100)
+        s2.lambdas = s2.lambdas * 0.9
+        with pytest.raises(ValueError):
+            OccupancyStore.concat([s1, s2])
+        s3, _ = _make_store(n_frames=100)
+        s3.meta["u_temperature"] = 290.0
+        with pytest.raises(ValueError):
+            OccupancyStore.concat([s1, s3])
+
+    def test_parse_runs(self, tmp_path):
+        from chacra.reweight import parse_runs
+
+        assert parse_runs("4-7") == [4, 5, 6, 7]
+        assert parse_runs("4,6,7") == [4, 6, 7]
+        assert parse_runs("5") == [5]
+        assert parse_runs([7, 4, 4]) == [4, 7]
+        assert parse_runs(None) == []
+        for r in (1, 3):
+            d = tmp_path / "contact_output" / f"run_{r}"
+            d.mkdir(parents=True)
+            (d / "occupancy.npz").write_bytes(b"")
+        assert parse_runs("all", tmp_path) == [1, 3]
+        with pytest.raises(ValueError):
+            parse_runs("7-4")

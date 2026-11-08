@@ -3,41 +3,47 @@ Single-state response estimators for ChACRA contact frequencies.
 
 Background
 ----------
-The "ChACRA identity" of the AAlostery Paper 1 framework states that for any
-1D Hamiltonian perturbation U(lambda) = U_0 + lambda * dU around a reference
-state lambda_0, the first- and second-order responses of contact occupancies
-phi_k are connected cumulants of equilibrium fluctuations at lambda_0:
+For the REST2 ladder femto runs, the reduced potential of a configuration is
+``u(x; lambda) = a(x) + b(x) lambda + c(x) sqrt(lambda)`` with
+``lambda = beta_m / beta_0`` (1 = the cold, unscaled Hamiltonian; smaller =
+hotter).  The first- and second-order responses of a contact occupancy
+``phi_k`` to lambda are connected cumulants at a single state::
 
-    R^{(1)}_k = d<phi_k>/dlambda |_{lambda_0}    = -beta * Cov(phi_k, dU)
-    R^{(2)}_k = d^2<phi_k>/dlambda^2 |_{lambda_0} = beta^2 * <delta phi_k * (delta dU)^2>_c
+    R1_k = d<phi_k>/dlambda    = -Cov(phi_k, u_lambda)
+    R2_k = d2<phi_k>/dlambda2  = <dphi_k (du_lambda)^2>_c - Cov(phi_k, u_lambdalambda)
 
-Standard ChACRA estimates these by running HREMD across many lambda values
-and reading the slope from the freqs(lambda) curve. The cumulant form
-above is mathematically equivalent at leading order, but estimable from the
-ensemble at a single replica — which (in principle) collapses the cost of
-the full lambda ladder.
+with ``u_lambda = b + c/(2 sqrt(lambda))`` and ``u_lambdalambda = -c/(4 lambda^(3/2))``
+per frame (beta is absorbed into the reduced units).  ChACRA's ladder PCA
+reads the same derivatives from <phi>(lambda) across states; the cumulants
+read them from the fluctuations of ONE state.  The MBAR estimator in
+:mod:`chacra.reweight` pools every state; the functions here are the
+single-state limit, computed on the same occupancy store with the same
+generators so that the two are directly comparable at a sampled lambda.
 
-This module implements the cumulant estimators and provides loaders that
-turn the femto + ultracontacts output of `chacra run-hremd` into the
-required per-frame arrays. A `compare_to_pca` helper lets you check that
-the single-state R^{(1)} reproduces ChACRA's PC1 to high cosine.
+What lives here
+---------------
+- :func:`cumulant_R1`, :func:`cumulant_R2`: the pure estimators on per-frame
+  arrays (``cumulant_R2`` is the third-cumulant term only; the pipeline path
+  in :func:`chacra.reweight.single_state_response` includes the
+  ``-Cov(phi, u_lambdalambda)`` term).
+- :func:`estimate_response_from_chacra_run`: the single-state estimate for a
+  ChACRA project from its occupancy store.
+- :func:`compare_to_pca`: |cos| of an R1 vector with ChACRA's PC1/PC2.  PC1 is
+  the ladder-AVERAGED slope, so this is informational, not a validation target;
+  validate against the local ladder slope or the MBAR derivative at the same
+  lambda instead.
+- Loaders for per-frame contacts (ultracontacts parquet, getcontacts TSV).
+- :func:`load_perturbation_energy_femto` is deprecated: it differenced u across
+  state index (not lambda) and used the opposite lambda convention.
 
 Conventions
 -----------
-- `phi`: per-frame contact occupancies, shape (n_frames, n_contacts), values
-  in [0, 1] (typical ultracontacts output is binary 0/1 per frame).
-- `dU`: per-frame value of the perturbation generator dU/dlambda evaluated
-  at the reference state, shape (n_frames,). Units: kJ/mol or kcal/mol —
-  must match `beta` so that `beta * dU` is dimensionless.
-- `beta`: 1/(k_B T) at the reference state, in inverse energy units that
-  cancel `dU`.
-- Returned `R1`, `R2`: same length as the contact axis, in units of
-  d<phi>/dlambda — dimensionless per unit lambda.
-
-Sign convention follows AAlostery `test_b_from_freqs.py`: lambda runs from
-0 (low effective T = unscaled) to 1 (high effective T = max scaling), so
-positive `R1_k` means contact k *gains* probability as the perturbation
-strengthens.
+- ``phi``: per-frame contact occupancies, shape (n_frames, n_contacts), in [0, 1].
+- ``dU``: per-frame generator du/dlambda at the reference state, (n_frames,),
+  in the same reduced units as ``beta * U`` so that ``beta * dU`` is dimensionless.
+- ``R1``, ``R2``: d<phi>/dlambda and d2<phi>/dlambda2, dimensionless per unit
+  lambda.  Positive ``R1_k`` means contact k gains probability as lambda grows
+  (i.e. as the ladder is traversed toward the cold, unscaled state).
 """
 
 from __future__ import annotations
@@ -193,6 +199,14 @@ def load_perturbation_energy_femto(
         difference. Returned so the caller can rescale dU if lambda is not
         the natural step (for example if comparing to T_eff-spaced ladders).
     """
+    import warnings
+
+    warnings.warn(
+        "load_perturbation_energy_femto differences u across STATE INDEX, not "
+        "lambda, and uses the opposite lambda convention; use "
+        "chacra.reweight.single_state_response on the occupancy store instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     from chacra.trajectories.process_hremd import load_femto_data
 
     df = load_femto_data(str(samples_arrow))
@@ -409,7 +423,11 @@ def load_per_frame_contacts_getcontacts(
 
 @dataclass
 class ResponseResult:
-    """Container for the single-state response estimate."""
+    """Container for the single-state response estimate.
+
+    ``beta`` is 1.0 when ``R1``/``R2`` come from femto's reduced potentials
+    (beta already absorbed).  ``lam`` is the state's lambda = beta_m/beta_0.
+    """
 
     R1: np.ndarray
     R2: np.ndarray | None
@@ -418,11 +436,23 @@ class ResponseResult:
     state_idx: int
     n_frames: int
     diagnostics: dict = field(default_factory=dict)
+    lam: float | None = None
+    phi_mean: np.ndarray | None = None
+    R1_err: np.ndarray | None = None
+    R2_err: np.ndarray | None = None
 
     def to_dataframe(self) -> pd.DataFrame:
-        df = pd.DataFrame({"R1": self.R1}, index=self.contact_names)
+        cols = {}
+        if self.phi_mean is not None:
+            cols["phi"] = self.phi_mean
+        cols["R1"] = self.R1
+        if self.R1_err is not None:
+            cols["R1_err"] = self.R1_err
         if self.R2 is not None:
-            df["R2"] = self.R2
+            cols["R2"] = self.R2
+            if self.R2_err is not None:
+                cols["R2_err"] = self.R2_err
+        df = pd.DataFrame(cols, index=self.contact_names)
         df.index.name = "contact"
         return df
 
@@ -562,103 +592,75 @@ def compare_to_pca(
 
 def estimate_response_from_chacra_run(
     project_dir: str | os.PathLike,
-    run: int = 1,
+    run: int | None = 1,
     state_idx: int | None = None,
-    method: str = "central",
+    method: str | None = None,
     save_interval: int | None = None,
+    runs: Sequence[int] | None = None,
+    n_boot: int = 0,
+    block: int = 50,
+    seed: int = 0,
+    rebuild_store: bool = False,
+    u_source_temperature: float | None = None,
+    store=None,
+    verbose: bool = True,
 ) -> ResponseResult:
-    """Run the full single-state estimator on a ChACRA project directory.
+    """Single-state cumulant estimate for one state of a ChACRA project.
 
-    Expects the standard ChACRA layout:
-        project_dir/
-            chacra_run.json
-            replica_trajectories/run_N/samples.arrow
-            contact_output/run_N/contacts/cont_state_{i}.parquet
-
-    Picks the middle replica by default (best central-difference accuracy
-    and best chance of being well-equilibrated under either side).
-
-    Parameters
-    ----------
-    project_dir : path
-        ChACRA project root.
-    run : int
-        Which run number to use (default 1).
-    state_idx : int, optional
-        Reference state. Defaults to n_states // 2.
-    method : {"central", "forward", "backward"}
-        Finite-difference rule for dU/dk; see `load_perturbation_energy_femto`.
-    save_interval : int, optional
-        Contact-frame spacing in cycles for THIS run. Defaults to the value
-        in chacra_run.json — which reflects the LATEST run, so it must be
-        passed explicitly when scoring an older run recorded with a
-        different interval (e.g. run_4 at 10 after run_5 rewrote it to 2).
+    Reads the run's occupancy store (``contact_output/run_N/occupancy.npz``,
+    built from the per-replica contacts and ``samples.arrow`` on first use)
+    and evaluates :func:`chacra.reweight.single_state_response` at
+    ``state_idx`` (default: the ladder midpoint).  ``runs`` pools several runs
+    of the same ladder first.  ``method`` is accepted for backward
+    compatibility and ignored (the generator is analytic, not a finite
+    difference across states).
     """
-    from chacra.run_config import RunConfig
+    import warnings
 
-    project_dir = Path(project_dir)
-    cfg_path = project_dir / "chacra_run.json"
-    cfg = RunConfig(str(cfg_path) if cfg_path.exists() else None)
+    from chacra.reweight import (
+        LEGACY_U_TEMPERATURE,
+        get_occupancy_store,
+        get_pooled_store,
+        single_state_response,
+    )
 
-    samples = project_dir / "replica_trajectories" / f"run_{run}" / "samples.arrow"
-    if not samples.exists():
-        raise FileNotFoundError(f"missing femto samples: {samples}")
-
-    if save_interval is None:
-        save_interval = cfg.get("save_interval")
-        if save_interval is None:
-            raise ValueError(
-                f"{cfg_path} has no 'save_interval'; pass save_interval= explicitly."
+    if method is not None:
+        warnings.warn(
+            "estimate_response_from_chacra_run(method=...) is ignored: du/dlambda "
+            "is now the analytic REST2 generator at the state's own lambda.",
+            DeprecationWarning, stacklevel=2,
+        )
+    if store is None:
+        legacy = u_source_temperature if u_source_temperature is not None else LEGACY_U_TEMPERATURE
+        if runs:
+            store = get_pooled_store(
+                project_dir, runs, rebuild=rebuild_store, legacy_u_temperature=legacy,
+                save_interval=save_interval, u_source_temperature=u_source_temperature,
+                verbose=verbose,
             )
-        save_interval = int(save_interval)
-    temps = cfg.get("temps")
-    if temps is None:
-        raise ValueError(
-            f"chacra_run.json at {cfg_path} has no 'temps' — re-run "
-            "process-output to populate it."
-        )
-    temps = np.asarray(temps, dtype=np.float64)
-    n_states = len(temps)
+        else:
+            if run is None:
+                raise ValueError("pass run= or runs=")
+            store = get_occupancy_store(
+                project_dir, run, rebuild=rebuild_store, legacy_u_temperature=legacy,
+                save_interval=save_interval, u_source_temperature=u_source_temperature,
+                verbose=verbose,
+            )
     if state_idx is None:
-        state_idx = n_states // 2
-
-    # beta of the *Hamiltonian* at the reference state. femto's u_kn are
-    # already reduced (multiplied by the relevant beta), so beta = 1.0 in
-    # those reduced units. We expose the choice so users with raw energies
-    # can override.
-    beta = 1.0
-
-    parquet = (
-        project_dir / "contact_output" / f"run_{run}" / "contacts"
-        / f"cont_state_{state_idx}.parquet"
-    )
-    if not parquet.exists():
-        raise FileNotFoundError(f"missing per-frame contacts: {parquet}")
-
-    phi, contact_names = load_per_frame_contacts(parquet)
-    dU, _ = load_perturbation_energy_femto(
-        samples, state_idx=state_idx, save_interval=save_interval, method=method,
-    )
-
-    # Truncate to common length — femto can have a partial last cycle.
-    # A LARGE mismatch is not a partial tail: it means save_interval does not
-    # match how this run's contact frames were actually saved, and silently
-    # truncating would pair phi frames with the wrong cycles' dU (garbage
-    # covariance that still yields a plausible-looking R1).
-    n = min(phi.shape[0], dU.shape[0])
-    if n < 0.95 * max(phi.shape[0], dU.shape[0]):
-        raise ValueError(
-            f"phi/dU length mismatch: {phi.shape[0]} contact frames vs "
-            f"{dU.shape[0]} strided dU values (save_interval={save_interval}). "
-            "chacra_run.json holds the LATEST run's save_interval — pass "
-            "save_interval= explicitly for the interval this run was saved at."
-        )
-    if n != phi.shape[0] or n != dU.shape[0]:
-        phi = phi[:n]
-        dU = dU[:n]
-
-    return estimate_response(
-        phi, dU, beta=beta,
-        contact_names=contact_names,
-        state_idx=state_idx,
+        state_idx = store.n_states // 2
+    r = single_state_response(store, state_idx, n_boot=n_boot, block=block, seed=seed)
+    diagnostics = {
+        "lambda": r.lam,
+        "T_eff": float(store.temps[state_idx]),
+        "n_frames": int(store.n_frames),
+        "n_contacts": int(store.n_contacts),
+        "phi_mean": float(r.phi_mean.mean()),
+        "phi_active_fraction": float((r.phi_mean > 0).mean()),
+        "u_temperature": store.meta.get("u_temperature"),
+        "runs": store.meta.get("runs", [store.meta.get("run")]),
+    }
+    return ResponseResult(
+        R1=r.R1, R2=r.R2, contact_names=list(store.contacts), beta=1.0,
+        state_idx=int(state_idx), n_frames=int(store.n_frames), diagnostics=diagnostics,
+        lam=r.lam, phi_mean=r.phi_mean, R1_err=r.R1_err, R2_err=r.R2_err,
     )

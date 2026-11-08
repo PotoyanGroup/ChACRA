@@ -194,6 +194,57 @@ class OccupancyStore:
         resid = float(np.abs(A @ coef - U).max())
         return coef[0], coef[1], coef[2], resid
 
+    # -- pooling across runs -------------------------------------------------
+    @classmethod
+    def concat(cls, stores: Sequence["OccupancyStore"]) -> "OccupancyStore":
+        """
+        Pool several runs of the SAME ladder into one store.
+
+        Contacts are the union (a contact absent from a run is 0 on its
+        frames); frames are concatenated per state in the order given.  All
+        stores must share the ladder (``lambdas``) and the temperature their
+        reduced potentials refer to (``meta["u_temperature"]``), otherwise the
+        pooled MBAR would mix inconsistent energies.  ``meta["segments"]``
+        records the frame boundaries between runs.
+        """
+        stores = list(stores)
+        if not stores:
+            raise ValueError("concat needs at least one store")
+        ref = stores[0]
+        for st in stores[1:]:
+            if st.n_states != ref.n_states or not np.allclose(st.lambdas, ref.lambdas, rtol=0, atol=1e-9):
+                raise ValueError("cannot pool stores with different ladders (lambdas differ)")
+            if st.meta.get("u_temperature") != ref.meta.get("u_temperature"):
+                raise ValueError(
+                    "cannot pool stores whose reduced potentials refer to different "
+                    f"temperatures: {st.meta.get('u_temperature')} vs {ref.meta.get('u_temperature')}"
+                )
+        contacts = sorted(set().union(*[set(st.contacts) for st in stores]))
+        cidx = {c: i for i, c in enumerate(contacts)}
+        K = ref.n_states
+        n_tot = sum(st.n_frames for st in stores)
+        phi = np.zeros((K, n_tot, len(contacts)), dtype=np.uint8)
+        u = np.empty((K, n_tot, K), dtype=np.float64)
+        off, segments = 0, [0]
+        for st in stores:
+            cols = np.array([cidx[c] for c in st.contacts], dtype=int)
+            phi[:, off:off + st.n_frames, cols] = st.phi
+            u[:, off:off + st.n_frames, :] = st.u
+            off += st.n_frames
+            segments.append(off)
+        meta = {
+            "runs": [st.meta.get("run") for st in stores],
+            "segments": segments,
+            "save_intervals": [st.meta.get("save_interval") for st in stores],
+            "contact_source": sorted({str(st.meta.get("contact_source")) for st in stores}),
+            "n_frames": int(n_tot),
+            "u_temperature": ref.meta.get("u_temperature"),
+            "u_source_temperature": [st.meta.get("u_source_temperature") for st in stores],
+            "legacy_rescaled": any(bool(st.meta.get("legacy_rescaled")) for st in stores),
+        }
+        return cls(phi=phi, u=u, contacts=contacts, lambdas=np.array(ref.lambdas, float),
+                   temps=np.array(ref.temps, float), meta=meta)
+
 
 # --------------------------------------------------------------------------- #
 # Loaders                                                                      #
@@ -379,7 +430,15 @@ def build_occupancy_store(
     cfg_path = project_dir / "chacra_run.json"
     cfg = RunConfig(str(cfg_path) if cfg_path.exists() else None)
     if save_interval is None:
-        save_interval = cfg.get("save_interval")
+        # chacra_run.json only remembers the LATEST run's value; a run written
+        # since the fix carries its own in run_meta.json.
+        meta_p = run_meta_path(project_dir, run)
+        if meta_p.exists():
+            import json as _json
+            with open(meta_p) as fh:
+                save_interval = _json.load(fh).get("save_interval")
+        if save_interval is None:
+            save_interval = cfg.get("save_interval")
         if save_interval is None:
             raise ValueError(
                 f"{cfg_path} has no 'save_interval'; pass save_interval= explicitly."
@@ -520,6 +579,75 @@ def get_occupancy_store(
     path.parent.mkdir(parents=True, exist_ok=True)
     store.save(path)
     return store
+
+
+def parse_runs(spec: str | Sequence[int] | None, project_dir: str | os.PathLike | None = None) -> list[int]:
+    """
+    Run numbers from ``"4-7"``, ``"4,6,7"``, ``"5"``, ``"all"`` or a sequence.
+
+    ``"all"`` lists ``contact_output/run_*/occupancy.npz`` under ``project_dir``
+    (falling back to ``replica_trajectories/run_*/samples.arrow``).
+    """
+    if spec is None:
+        return []
+    if not isinstance(spec, str):
+        return sorted({int(r) for r in spec})
+    spec = spec.strip().lower()
+    if spec == "all":
+        if project_dir is None:
+            raise ValueError("parse_runs('all') needs project_dir")
+        root = Path(project_dir)
+        found = [p.parent.name for p in root.glob("contact_output/run_*/occupancy.npz")]
+        if not found:
+            found = [p.parent.name for p in root.glob("replica_trajectories/run_*/samples.arrow")]
+        runs = sorted(int(n.split("_")[1]) for n in found if n.split("_")[1].isdigit())
+        if not runs:
+            raise FileNotFoundError(f"no runs found under {root}")
+        return runs
+    runs: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            if b < a:
+                raise ValueError(f"bad run range {part!r}")
+            runs.update(range(a, b + 1))
+        else:
+            runs.add(int(part))
+    return sorted(runs)
+
+
+def get_pooled_store(
+    project_dir: str | os.PathLike,
+    runs: Sequence[int],
+    rebuild: bool = False,
+    legacy_u_temperature: float | None = LEGACY_U_TEMPERATURE,
+    verbose: bool = True,
+    **kw,
+) -> OccupancyStore:
+    """
+    One :class:`OccupancyStore` pooling the given runs (each loaded or built
+    with :func:`get_occupancy_store`, then :meth:`OccupancyStore.concat`).
+    A single run returns that run's store unchanged.
+    """
+    runs = list(runs)
+    if not runs:
+        raise ValueError("get_pooled_store needs at least one run")
+    stores = [
+        get_occupancy_store(project_dir, r, rebuild=rebuild,
+                            legacy_u_temperature=legacy_u_temperature, verbose=verbose, **kw)
+        for r in runs
+    ]
+    if len(stores) == 1:
+        return stores[0]
+    pooled = OccupancyStore.concat(stores)
+    if verbose:
+        print(f"  [reweight] pooled runs {runs}: {pooled.n_states} states x "
+              f"{pooled.n_frames} frames x {pooled.n_contacts} contacts")
+    return pooled
 
 
 # --------------------------------------------------------------------------- #
@@ -665,6 +793,69 @@ class LambdaResponse:
     R2_err: np.ndarray | None = None
 
 
+def _generators_from_coefficients(b: np.ndarray, c: np.ndarray, lam: float) -> tuple[np.ndarray, np.ndarray]:
+    """du/dlambda and d2u/dlambda2 per frame from the REST2 fit coefficients."""
+    s = np.sqrt(lam)
+    return b + c / (2.0 * s), -c / (4.0 * lam * s)
+
+
+def ladder_slope(store: OccupancyStore, state_idx: int) -> np.ndarray:
+    """Finite-difference d<phi>/dlambda at a sampled state from the per-state frequencies
+    (central in the interior, one-sided at the ends)."""
+    f = store.freqs().to_numpy()
+    lam = np.asarray(store.lambdas, float)
+    k = int(state_idx)
+    if k == 0:
+        return (f[1] - f[0]) / (lam[1] - lam[0])
+    if k == len(lam) - 1:
+        return (f[-1] - f[-2]) / (lam[-1] - lam[-2])
+    return (f[k + 1] - f[k - 1]) / (lam[k + 1] - lam[k - 1])
+
+
+def single_state_response(
+    store: OccupancyStore,
+    state_idx: int,
+    n_boot: int = 0,
+    block: int = 50,
+    seed: int = 0,
+) -> LambdaResponse:
+    """
+    Single-state cumulant estimate of R1, R2 at a sampled state.
+
+    Uses only that state's frames with uniform weights and the exact REST2
+    generators at its own lambda, ``du/dlambda = b + c/(2 sqrt(lam))`` and
+    ``d2u/dlambda2 = -c/(4 lam^(3/2))``, from the per-frame fit of
+    ``u = a + b lam + c sqrt(lam)`` (no MBAR solve).  Same units and lambda
+    convention as :class:`ResponseEstimator`, so the two are directly
+    comparable at ``store.lambdas[state_idx]``.  ``n_boot > 0`` adds block
+    bootstrap errors over blocks of ``block`` consecutive frames.
+    """
+    K, n_fr, _ = store.phi.shape
+    if not 0 <= state_idx < K:
+        raise IndexError(f"state_idx={state_idx} out of range [0, {K - 1}]")
+    lam = float(store.lambdas[state_idx])
+    _, b, c, _ = store.energy_decomposition()
+    g1, g2 = _generators_from_coefficients(b, c, lam)
+    sl = slice(state_idx * n_fr, (state_idx + 1) * n_fr)
+    w = np.zeros(K * n_fr)
+    w[sl] = 1.0
+    phi_mean, R1, R2 = _response_from_moments(_weighted_moments(store, w, g1, g2))
+    out = LambdaResponse(lam=lam, phi_mean=phi_mean, R1=R1, R2=R2, ess=float(n_fr))
+    if n_boot > 0:
+        rng = np.random.default_rng(seed)
+        n_blocks = int(np.ceil(n_fr / block))
+        R1s, R2s = [], []
+        for _ in range(n_boot):
+            counts = np.bincount(rng.integers(0, n_blocks, n_blocks), minlength=n_blocks)
+            wb = np.zeros(K * n_fr)
+            wb[sl] = np.repeat(counts, block)[:n_fr]
+            _, r1, r2 = _response_from_moments(_weighted_moments(store, wb, g1, g2))
+            R1s.append(r1); R2s.append(r2)
+        out.R1_err = np.std(R1s, axis=0, ddof=1)
+        out.R2_err = np.std(R2s, axis=0, ddof=1)
+    return out
+
+
 class ResponseEstimator:
     """
     Pooled (MBAR) response estimator for one :class:`OccupancyStore`.
@@ -743,32 +934,14 @@ class ResponseEstimator:
         return base
 
     # -- ladder-based comparisons ---------------------------------------------
-    def single_state(self, state_idx: int) -> LambdaResponse:
-        """
-        The single-state cumulant estimate at a sampled state (only that
-        state's frames, uniform weights) using the same analytic generators —
-        for comparison with the pooled estimate.
-        """
-        K, n_fr, _ = self.store.phi.shape
-        mask = np.zeros(K * n_fr, dtype=bool)
-        mask[state_idx * n_fr:(state_idx + 1) * n_fr] = True
-        lam = float(self.store.lambdas[state_idx])
-        w = mask.astype(float)
-        g1, g2 = self.generators(lam)
-        m = _weighted_moments(self.store, w, g1, g2)
-        phi_mean, R1, R2 = _response_from_moments(m)
-        return LambdaResponse(lam=lam, phi_mean=phi_mean, R1=R1, R2=R2, ess=float(n_fr))
+    def single_state(self, state_idx: int, n_boot: int = 0, block: int = 50,
+                     seed: int = 0) -> LambdaResponse:
+        """Single-state cumulant estimate at a sampled state; see :func:`single_state_response`."""
+        return single_state_response(self.store, state_idx, n_boot=n_boot, block=block, seed=seed)
 
     def ladder_slope(self, state_idx: int) -> np.ndarray:
-        """Central finite-difference d<phi>/dlambda from the raw per-state frequencies."""
-        f = self.store.freqs().to_numpy()
-        lam = self.store.lambdas
-        k = state_idx
-        if k == 0:
-            return (f[1] - f[0]) / (lam[1] - lam[0])
-        if k == len(lam) - 1:
-            return (f[-1] - f[-2]) / (lam[-1] - lam[-2])
-        return (f[k + 1] - f[k - 1]) / (lam[k + 1] - lam[k - 1])
+        """Finite-difference d<phi>/dlambda at a sampled state; see :func:`ladder_slope`."""
+        return ladder_slope(self.store, state_idx)
 
 
 # --------------------------------------------------------------------------- #

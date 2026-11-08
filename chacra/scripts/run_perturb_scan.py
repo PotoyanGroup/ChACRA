@@ -29,6 +29,9 @@ def main():
     )
     p.add_argument("--project_dir", default=".")
     p.add_argument("--run", type=int, default=None, help="Run number (default: latest with a store).")
+    p.add_argument("--runs", type=str, default=None,
+                   help="Pool several runs of the same ladder, e.g. '4-7', '4,6,7' or 'all'. "
+                        "Outputs go to analysis_output/run_<last>/ tagged _runs<a>-<b>.")
     p.add_argument("--generator", choices=["contact", "energy"], default="contact",
                    help="contact: chi·J in the contact basis (cheap). energy: OpenMM dU/ds_i per residue.")
     p.add_argument("--lam", type=float, default=1.0,
@@ -48,7 +51,7 @@ def main():
     g.add_argument("--delta", type=float, default=0.02, help="Finite-difference step in s_i.")
     args = p.parse_args()
 
-    from chacra.reweight import ResponseEstimator, get_occupancy_store
+    from chacra.reweight import ResponseEstimator, get_occupancy_store, get_pooled_store, parse_runs
     from chacra.perturb import (
         contact_basis_scan, energy_basis_scan, energy_generators_for_store,
         rank_perturbation_sites, contact_residues,
@@ -63,10 +66,13 @@ def main():
         if not stores:
             sys.exit("no contact_output/run_*/occupancy.npz; run process-output or `chacra response` first.")
         args.run = int(stores[-1].parent.name.split("_")[1])
+    runs = parse_runs(args.runs, project) if args.runs else []
+    if runs:
+        args.run = runs[-1]
     out_dir = project / "analysis_output" / f"run_{args.run}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    store = get_occupancy_store(project, args.run)
+    store = get_pooled_store(project, runs) if len(runs) > 1 else get_occupancy_store(project, args.run)
     est = ResponseEstimator(store)
     print(f"[perturb-scan] run {args.run}: {store.n_states} states x {store.n_frames} frames x "
           f"{store.n_contacts} contacts; lambda={args.lam} ESS={est.ess(args.lam):.0f}")
