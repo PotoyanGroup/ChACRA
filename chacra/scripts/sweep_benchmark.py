@@ -138,12 +138,17 @@ def _probe_worker(args):
     )
 
     # No trajectories / checkpoints during probes — pure timing + exchange data.
-    hremd_config = femto.md.config.HREMD(
+    # beta for the stored energies and the swap test = the thermostat temperature.
+    from chacra.simulation import build_hremd_config
+
+    hremd_config = build_hremd_config(
         n_warmup_steps=args.warmup_steps,
         n_steps_per_cycle=args.steps_per_cycle,
         n_cycles=args.cycles,
         trajectory_interval=args.cycles + 1,
         checkpoint_interval=args.cycles + 1,
+        temperature_K=rest_temperatures[0].value_in_unit(openmm.unit.kelvin),
+        verbose=False,
     )
 
     with femto.md.utils.mpi.get_mpi_comm() as mpi_comm:

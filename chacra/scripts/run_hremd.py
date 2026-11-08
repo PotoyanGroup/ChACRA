@@ -154,6 +154,17 @@ def main():
              "e.g. 'srun --mpi=pmix'.",
     )
 
+    parser.add_argument(
+        "--hremd_temperature",
+        type=float,
+        default=None,
+        dest="hremd_temperature",
+        help="Temperature (K) femto uses for beta in the stored reduced "
+             "potentials and the swap test.  New projects: min_temp (the "
+             "thermostat temperature).  Continuations keep the value stored in "
+             "chacra_run.json; a ladder started before this option existed "
+             "used femto's default, 298.15 K, and must keep it.",
+    )
     args = parser.parse_args()
 
     # Backward compat: honour the old --oversubscribe / -o flag
@@ -340,6 +351,54 @@ def main():
                 )
 
     # ------------------------------------------------------------------ #
+    # Temperature femto scores reduced potentials at                      #
+    # femto's HREMD config defaults to 298.15 K.  Earlier ChACRA versions #
+    # never set it, so their u_kn carry beta(298.15 K) while the MD ran   #
+    # at min_temp.  One ladder must keep ONE value across its runs: new   #
+    # projects use min_temp, continuations keep what they started with.  #
+    # ------------------------------------------------------------------ #
+    from chacra.simulation import (
+        FEMTO_DEFAULT_TEMPERATURE_K,
+        barostat_temperature_from_xml,
+    )
+
+    hremd_temperature = args.hremd_temperature
+    if hremd_temperature is None:
+        stored = run_config.get("hremd_temperature")
+        if stored is not None:
+            hremd_temperature = float(stored)
+        elif current_run == 1:
+            hremd_temperature = float(args.min_temp)
+        else:
+            hremd_temperature = FEMTO_DEFAULT_TEMPERATURE_K
+            print(
+                "\n" + "=" * 60 + "\n"
+                f"  NOTICE: continuing run {current_run} of a ladder whose config has no\n"
+                f"  'hremd_temperature'.  Keeping femto's historical default, "
+                f"{FEMTO_DEFAULT_TEMPERATURE_K} K,\n"
+                "  so all runs of this ladder share one ensemble.  Rescale the stored\n"
+                f"  energies by {FEMTO_DEFAULT_TEMPERATURE_K}/{args.min_temp} in analysis.\n"
+                "  Pass --hremd_temperature to override.\n" + "=" * 60 + "\n"
+            )
+    hremd_temperature = float(hremd_temperature)
+    if abs(hremd_temperature - float(args.min_temp)) > 1e-6:
+        print(
+            f"WARNING: reduced potentials will be scored at {hremd_temperature} K "
+            f"but the thermostat runs at {args.min_temp} K; the stored u_kn are "
+            f"scaled by {float(args.min_temp) / hremd_temperature:.4f} and the swap "
+            "test is slightly biased."
+        )
+    try:
+        _t_baro = barostat_temperature_from_xml(args.system_file)
+    except OSError:
+        _t_baro = None
+    if _t_baro is not None and abs(_t_baro - float(args.min_temp)) > 0.5:
+        print(
+            f"WARNING: the system's MonteCarloBarostat is set to {_t_baro} K but "
+            f"min_temp is {args.min_temp} K; rebuild the system or match min_temp."
+        )
+
+    # ------------------------------------------------------------------ #
     # Build run-femto args (run-femto always runs inside MPI now)         #
     # ------------------------------------------------------------------ #
     femto_args = [
@@ -356,6 +415,7 @@ def main():
         "--warmup_steps",  str(args.warmup_steps),
         "--lambda_selection", args.lambda_selection,
         "--timestep",      str(args.timestep),
+        "--hremd_temperature", str(hremd_temperature),
     ]
 
     # Total MPI ranks = GPUs-in-use × MPS replicas per GPU
@@ -400,6 +460,7 @@ def main():
         n_jobs=args.n_jobs,
         mps_replicas=args.mps_replicas,
         mpi_command=args.mpi_command,
+        hremd_temperature=hremd_temperature,
         current_run=current_run,
     )
     # Remove legacy key if present
@@ -462,6 +523,25 @@ def main():
 
         times["end"] = datetime.now().strftime("%H:%M")
 
+        # Per-run provenance (chacra_run.json keeps only the latest values).
+        import json as _json
+        run_meta = {
+            "run": current_run,
+            "hremd_temperature": hremd_temperature,
+            "min_temp": float(args.min_temp),
+            "max_temp": float(args.max_temp),
+            "n_systems": int(n_systems),
+            "save_interval": int(args.save_interval),
+            "steps_per_cycle": int(args.steps_per_cycle),
+            "timestep": args.timestep,
+            "n_cycles": int(args.n_cycles),
+            "total_cycles": int(total_cycles),
+            "first_cycle": int(total_cycles) - int(args.n_cycles),
+            "written": datetime.now().isoformat(timespec="seconds"),
+        }
+        with open(f"./replica_trajectories/run_{current_run}/run_meta.json", "w") as fh:
+            _json.dump(run_meta, fh, indent=2)
+
         # Process the replicas to state trajectories and run analyses.
         # Pass --config so process-output reads temps/n_systems from JSON.
         analysis_command = [
@@ -495,6 +575,7 @@ def main():
             f.write(f"n_steps   : {args.steps_per_cycle * args.n_cycles}\n")
             f.write(f"save_interval : {args.save_interval}\n")
             f.write(f"checkpoint_interval : {args.checkpoint_interval}\n")
+            f.write(f"hremd_temperature : {hremd_temperature}\n")
 
     except subprocess.CalledProcessError as e:
         print("\n" + "="*60)

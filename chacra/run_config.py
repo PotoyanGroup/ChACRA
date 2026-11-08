@@ -76,6 +76,7 @@ class RunConfig:
         "timestep": 2,
         "current_run": 0,
         "mps_replicas": 1,
+        "hremd_temperature": None,   # beta for femto's reduced potentials; min_temp on new projects
     }
 
     def __init__(self, config_file: str | None = None):
