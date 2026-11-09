@@ -2,6 +2,20 @@ from chacra.simulation import OMMSetup, fix_pdb
 import argparse
 import os
 
+# OpenMM keeps the water model in its own XML; addSolvent needs one.  The
+# old default "amber14-all.xml" alone failed with "No template found for
+# residue N (HOH)" on the water it had just added.
+DEFAULT_FORCEFIELDS = "amber14-all.xml,amber14/tip3pfb.xml"
+_WATER_MODEL_HINTS = ("tip3p", "tip4p", "tip5p", "spce", "spc", "opc", "water")
+
+
+def has_water_model(forcefields):
+    """True if one of the force-field file names looks like a water model."""
+    return any(
+        any(hint in os.path.basename(f).lower() for hint in _WATER_MODEL_HINTS)
+        for f in forcefields
+    )
+
 def main():
     parser = argparse.ArgumentParser(
         description="""
@@ -78,14 +92,20 @@ def main():
     parser.add_argument(
         "--forcefield", type=str, required=False,
         help="""
-        The forcefield to use for the simulation.
+        Comma-separated OpenMM force-field XML files.  Must include a water
+        model (OpenMM keeps it in its own file), or addSolvent cannot
+        parameterize the water it adds.
         """,
-        default="amber14-all.xml"
+        default=DEFAULT_FORCEFIELDS
     )
 
     args = parser.parse_args()
     pressure = float(args.pressure)
     temperature = float(args.temperature)
+    forcefields = [f.strip() for f in args.forcefield.split(",") if f.strip()]
+    if not has_water_model(forcefields):
+        print(f"WARNING: none of --forcefield {forcefields} looks like a water model; "
+              f"addSolvent needs one (default: {DEFAULT_FORCEFIELDS}).")
     if args.timestep > 2 and args.hmass < 3.0:
         parser.error(
             f"--timestep {args.timestep} fs needs hydrogen mass repartitioning "
@@ -107,9 +127,19 @@ def main():
         pressure=pressure,
         Hmass=args.hmass,
         timestep=args.timestep,
-        forcefields=[f for f in args.forcefield.split(",")]
+        forcefields=forcefields,
     )
-    setup.model()
+    try:
+        setup.model()
+    except ValueError as e:
+        if "No template found" in str(e) and "HOH" in str(e):
+            raise SystemExit(
+                "make-simulation: the force field has no water template, so the "
+                "water addSolvent adds cannot be parameterized.  Add a water model "
+                f"to --forcefield, e.g. --forcefield {DEFAULT_FORCEFIELDS}\n"
+                f"  (OpenMM said: {e})"
+            ) from None
+        raise
     print(f"Adding solvent.")
     setup.make_system()
     print("Minimizing the system.")

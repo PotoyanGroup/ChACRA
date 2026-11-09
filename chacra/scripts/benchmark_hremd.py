@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import datetime
 
-from chacra.mpi import build_mpi_command
+from chacra.mpi import build_mpi_command, chacra_command, ensure_mps, stop_mps
 
 
 def _run_worker(args):
@@ -306,34 +306,35 @@ def main():
         n_total_ranks,
         mpi_command=args.mpi_command,
     )
-    cmd = mpi_prefix + [
-        "chacra", "benchmark-hremd", "--is-mpi-worker",
-    ]
+    # The worker runs through this interpreter (absolute path), not a bare
+    # "chacra" that the ranks' PATH may not resolve.
+    cmd = mpi_prefix + chacra_command() + ["benchmark-hremd", "--is-mpi-worker"]
     # Forward all original args (except --is-mpi-worker which we just added)
     cmd.extend(sys.argv[1:])
 
-    run_env = os.environ.copy()
+    # MPS is configured before the rank environment is copied so daemon and
+    # ranks agree on the pipe directory and the thread percentage.
+    mps_started = False
     if args.mps_replicas > 1:
-        import femto.md.utils.mpi as _fmpi
-
         thread_pct = max(1, 200 // args.mps_replicas)
-        run_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(thread_pct)
+        os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(thread_pct)
         print(
             f"CUDA MPS: {args.mps_replicas} replicas/GPU, "
             f"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={thread_pct}%"
         )
-        if not _fmpi.is_mps_running():
-            from chacra.mpi import configure_mps_env
-
-            configure_mps_env()
-            print("Starting CUDA MPS daemon...")
-            _fmpi.start_mps()
+        mps_started = ensure_mps()
+        print("Started CUDA MPS daemon." if mps_started
+              else "CUDA MPS daemon already running; using it.")
+    run_env = os.environ.copy()
 
     print(f"Launching benchmark: {' '.join(cmd)}\n")
     try:
         subprocess.run(cmd, env=run_env, check=True)
     except KeyboardInterrupt:
         pass
+    finally:
+        if mps_started:
+            stop_mps()
 
 
 if __name__ == "__main__":

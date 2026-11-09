@@ -46,7 +46,7 @@ import time
 
 import numpy as np
 
-from chacra.mpi import build_mpi_command, configure_mps_env
+from chacra.mpi import build_mpi_command, ensure_mps, stop_mps
 
 # Scratch lives in the CWD so it is on a shared filesystem for multi-node runs.
 _SCRATCH = pathlib.Path(".chacra_sweep_scratch")
@@ -692,15 +692,13 @@ def main():
 
     _SCRATCH.mkdir(exist_ok=True)
 
-    # MPS lets several ranks share one GPU concurrently.
+    # MPS lets several ranks share one GPU concurrently.  ensure_mps() gives the
+    # job its own pipe directory and tolerates a daemon that is already up.
     mps_started = False
-    fmpi = None
     try:
-        import femto.md.utils.mpi as fmpi
-        if not fmpi.is_mps_running():
-            configure_mps_env()
-            fmpi.start_mps()
-            mps_started = True
+        mps_started = ensure_mps()
+        print("  CUDA MPS : started daemon" if mps_started
+              else "  CUDA MPS : daemon already running")
     except Exception as e:  # noqa: BLE001
         print(f"  Note: CUDA MPS not started ({e}); shared-GPU runs will time-slice.")
 
@@ -735,8 +733,8 @@ def main():
                 json.dump(results, f, indent=2)
             print(f"  Detailed results: {opts.save_results}\n")
     finally:
-        if mps_started and fmpi is not None:
-            fmpi.stop_mps()
+        if mps_started:
+            stop_mps()
         if not opts.keep_scratch:
             shutil.rmtree(_SCRATCH, ignore_errors=True)
 

@@ -8,7 +8,7 @@ from datetime import datetime
 
 import numpy as np
 
-from chacra.mpi import build_mpi_command
+from chacra.mpi import build_mpi_command, chacra_command, ensure_mps
 from chacra.trajectories.process_hremd import *
 from chacra.run_config import RunConfig
 
@@ -449,8 +449,10 @@ def main():
     # ------------------------------------------------------------------ #
     # Build run-femto args (run-femto always runs inside MPI now)         #
     # ------------------------------------------------------------------ #
-    femto_args = [
-        "chacra", "run-femto",
+    # run-femto runs through this interpreter (absolute path), not a bare
+    # "chacra" that the ranks' PATH may not resolve.
+    femto_args = chacra_command() + [
+        "run-femto",
         "--system_file",   args.system_file,
         "--structure_file", args.structure_file,
         "--n_cycles",      str(total_cycles),
@@ -520,19 +522,21 @@ def main():
     times = {}
     times["start"] = datetime.now().strftime("%H:%M")
 
-    # Prepare MPS-aware environment for multi-replica-per-GPU runs
-    run_env = os.environ.copy()
+    # Prepare the MPS-aware environment for multi-replica-per-GPU runs.  MPS is
+    # configured before the rank environment is copied so daemon and ranks
+    # agree on the pipe directory and the thread percentage.  The daemon is
+    # left running at the end: a batch script may call run-hremd again, and
+    # Slurm removes it with the job.
     if args.mps_replicas > 1:
-        import femto.md.utils.mpi as _fmpi
         thread_pct = max(1, 200 // args.mps_replicas)
-        run_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(thread_pct)
+        os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(thread_pct)
         print(f"CUDA MPS: {args.mps_replicas} replicas/GPU, "
               f"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={thread_pct}%")
-        if not _fmpi.is_mps_running():
-            from chacra.mpi import configure_mps_env
-            configure_mps_env()
-            print("Starting CUDA MPS daemon...")
-            _fmpi.start_mps()
+        if ensure_mps():
+            print("Started CUDA MPS daemon.")
+        else:
+            print("CUDA MPS daemon already running; using it.")
+    run_env = os.environ.copy()
 
     print(
         f"\n  Run {current_run}: {total_cycles} total cycles "
@@ -600,8 +604,8 @@ def main():
         # Pass --config so process-output reads temps/n_systems from JSON.
         # process-output picks its own CPU worker count (the job's affinity
         # mask), not the GPU count; --n_jobs here used to throttle it to n_gpus.
-        analysis_command = [
-            "chacra", "process-output",
+        analysis_command = chacra_command() + [
+            "process-output",
             "--run",
             str(current_run),
             "--structure_file",
