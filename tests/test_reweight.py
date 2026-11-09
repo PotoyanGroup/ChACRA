@@ -330,3 +330,22 @@ class TestPymbarAndBootstrapGuards:
             warnings.simplefilter("error", RuntimeWarning)
             r = single_state_response(store, 0, n_boot=2, block=50)
         assert r.R1_err is not None and np.all(np.isfinite(r.R1_err))
+
+
+def test_residue_pairs_from_tsv_matches_unique(tmp_path):
+    """The streaming parser gives np.unique's sorted names and inverse codes."""
+    from chacra.reweight import _residue_pairs_from_tsv
+
+    tsv = tmp_path / "c.tsv"
+    tsv.write_text(
+        "# total_frames:3 beg:0 end:2 stride:1\n# Columns: frame, type, atom_1, atom_2, d\n"
+        "0\thp\tA:LEU:5:CD1\tA:VAL:9:CG1\t3.9\n"
+        "0\tsb\tA:GLU:2:OE1\tA:ARG:7:NH1\t3.1\n"
+        "1\thp\tA:VAL:9:CG2\tA:LEU:5:CD2\t4.0\n"
+        "\n"
+        "2\thb\tA:ARG:7:NE\tA:GLU:2:OE2\t2.9\n"
+    )
+    frames, uniq, inv = _residue_pairs_from_tsv(tsv)
+    assert frames.tolist() == [0, 0, 1, 2]
+    assert uniq.tolist() == ["A:ARG:7-A:GLU:2", "A:LEU:5-A:VAL:9"]
+    assert inv.tolist() == [1, 0, 1, 0] and inv.dtype == np.int32

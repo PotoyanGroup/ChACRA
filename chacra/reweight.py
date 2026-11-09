@@ -287,11 +287,20 @@ def _residue_pairs_from_long_parquet(path: str | os.PathLike):
 
 
 def _residue_pairs_from_tsv(path: str | os.PathLike):
-    """getcontacts per-frame TSV → (frames, unique pair names, int32 codes)."""
-    frames, pairs = [], []
+    """getcontacts per-frame TSV → (frames, unique pair names, int32 codes).
+
+    Streams the file once and maps each residue pair to an integer as it is
+    seen (array-backed, so a 100-million-line TSV needs about 1 GB rather than
+    the tens of GB a list of Python strings would take), then renumbers the
+    codes into sorted-name order, so the result equals
+    ``np.unique(pairs, return_inverse=True)`` on the old materialised list.
+    """
+    from array import array
+
+    frames, codes, index = array("q"), array("i"), {}
     with open(path) as fh:
         for line in fh:
-            if line.startswith("#") or not line.strip():
+            if line.startswith("#"):
                 continue
             parts = line.split()
             if len(parts) < 4:
@@ -302,11 +311,20 @@ def _residue_pairs_from_tsv(path: str | os.PathLike):
                 continue
             r1 = ":".join(parts[2].split(":")[:3])
             r2 = ":".join(parts[3].split(":")[:3])
+            pair = f"{r1}-{r2}" if r1 <= r2 else f"{r2}-{r1}"
+            code = index.get(pair)
+            if code is None:
+                code = len(index)
+                index[pair] = code
             frames.append(fr)
-            pairs.append(f"{r1}-{r2}" if r1 <= r2 else f"{r2}-{r1}")
-    frames = np.asarray(frames, dtype=np.int64)
-    uniq, inv = np.unique(np.asarray(pairs, dtype=object), return_inverse=True)
-    return frames, uniq, inv.astype(np.int32)
+            codes.append(code)
+    names = np.array(list(index.keys()), dtype=object)
+    order = np.argsort(names) if len(names) else np.zeros(0, dtype=np.int64)
+    rank = np.empty(len(names), dtype=np.int32)
+    rank[order] = np.arange(len(names), dtype=np.int32)
+    frames_arr = np.frombuffer(frames, dtype=np.int64).copy() if len(frames) else np.zeros(0, np.int64)
+    inv = rank[np.frombuffer(codes, dtype=np.int32)] if len(codes) else np.zeros(0, np.int32)
+    return frames_arr, names[order], inv.astype(np.int32)
 
 
 def _residue_pairs(path: str | os.PathLike):
