@@ -279,3 +279,54 @@ class TestSingleStateAndPooling:
         assert parse_runs("all", tmp_path) == [1, 3]
         with pytest.raises(ValueError):
             parse_runs("7-4")
+
+
+class TestPymbarAndBootstrapGuards:
+    """pymbar stays off JAX unless asked (the CUDA plugin segfaulted on A100 nodes),
+    and a bootstrap that collapses to one block says so."""
+
+    def test_pymbar_runs_without_jax_by_default(self, monkeypatch):
+        import os
+        from chacra.reweight import _configure_pymbar_env
+
+        monkeypatch.delenv("PYMBAR_DISABLE_JAX", raising=False)
+        monkeypatch.delenv("CHACRA_PYMBAR_JAX", raising=False)
+        _configure_pymbar_env()
+        assert os.environ["PYMBAR_DISABLE_JAX"] == "1"
+
+    def test_user_can_opt_into_jax(self, monkeypatch):
+        import os
+        from chacra.reweight import _configure_pymbar_env
+
+        monkeypatch.delenv("PYMBAR_DISABLE_JAX", raising=False)
+        monkeypatch.setenv("CHACRA_PYMBAR_JAX", "1")
+        _configure_pymbar_env()
+        assert "PYMBAR_DISABLE_JAX" not in os.environ
+
+    def test_explicit_user_setting_is_kept(self, monkeypatch):
+        import os
+        from chacra.reweight import _configure_pymbar_env
+
+        monkeypatch.setenv("PYMBAR_DISABLE_JAX", "0")
+        monkeypatch.delenv("CHACRA_PYMBAR_JAX", raising=False)
+        _configure_pymbar_env()
+        assert os.environ["PYMBAR_DISABLE_JAX"] == "0"
+
+    def test_single_block_bootstrap_warns(self):
+        from chacra.reweight import ResponseEstimator, single_state_response
+
+        store, _ = _make_store(n_frames=40)
+        with pytest.warns(RuntimeWarning, match="single bootstrap block"):
+            single_state_response(store, 0, n_boot=2, block=100)
+        with pytest.warns(RuntimeWarning, match="single bootstrap block"):
+            ResponseEstimator(store, use_pymbar=False).bootstrap(1.0, n_boot=2, block=100)
+
+    def test_enough_blocks_do_not_warn(self):
+        import warnings
+        from chacra.reweight import single_state_response
+
+        store, _ = _make_store(n_frames=400)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            r = single_state_response(store, 0, n_boot=2, block=50)
+        assert r.R1_err is not None and np.all(np.isfinite(r.R1_err))

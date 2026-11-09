@@ -45,6 +45,7 @@ Layout
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -686,6 +687,32 @@ def _initial_free_energies(u_kn: np.ndarray, N_k: np.ndarray) -> np.ndarray:
     return f
 
 
+def _configure_pymbar_env() -> None:
+    """Keep pymbar on its numpy/scipy solver unless the user opts into JAX.
+
+    pymbar 4 imports JAX whenever it is installed and flips it to 64-bit mode
+    on the first solve.  JAX then initialises every PJRT plugin it finds,
+    whatever ``JAX_PLATFORMS`` says; with ``jax-cuda12-plugin`` installed, the
+    plugin's CUDA version check segfaulted ``chacra response`` on A100 nodes
+    (Nova job 17326757) while the same store ran fine on CPU nodes.  MBAR on a
+    contact ladder (<= 48 states, 1e4-1e5 frames) takes seconds without JAX, so
+    ChACRA sets ``PYMBAR_DISABLE_JAX=1`` before importing pymbar unless the
+    variable is already set or ``CHACRA_PYMBAR_JAX=1`` opts back in.
+    """
+    if os.environ.get("CHACRA_PYMBAR_JAX", "").strip().lower() in ("1", "true", "yes"):
+        return
+    os.environ.setdefault("PYMBAR_DISABLE_JAX", "1")
+
+
+def _warn_single_block(n_frames: int, block: int, what: str) -> None:
+    if int(np.ceil(n_frames / block)) < 2:
+        warnings.warn(
+            f"{what}: {n_frames} frames per state and block={block} give a single "
+            f"bootstrap block, so the errors are zero; use a block below {n_frames // 2 or 1}.",
+            RuntimeWarning, stacklevel=3,
+        )
+
+
 def mbar_free_energies(
     u_kn: np.ndarray,
     N_k: np.ndarray,
@@ -715,6 +742,7 @@ def mbar_free_energies(
 
     if use_pymbar:
         try:
+            _configure_pymbar_env()
             import pymbar
 
             mb = pymbar.MBAR(u_kn, N_k, initial_f_k=f, verbose=False)
@@ -858,6 +886,7 @@ def single_state_response(
     if n_boot > 0:
         rng = np.random.default_rng(seed)
         n_blocks = int(np.ceil(n_fr / block))
+        _warn_single_block(n_fr, block, "single_state_response")
         R1s, R2s = [], []
         for _ in range(n_boot):
             counts = np.bincount(rng.integers(0, n_blocks, n_blocks), minlength=n_blocks)
@@ -932,6 +961,7 @@ class ResponseEstimator:
         g1, g2 = self.generators(lam)
         base = self.at(lam)
         n_blocks = int(np.ceil(n_fr / block))
+        _warn_single_block(n_fr, block, "ResponseEstimator.bootstrap")
         R1s, R2s = [], []
         for _ in range(n_boot):
             # multiplicity of each block per state -> per-frame multiplicity

@@ -161,7 +161,7 @@ ChACRA's chacras are principal components of the contact frequencies across the 
 
 `chacra perturb-scan` uses the MBAR-weighted contact covariance `chi_kl = Cov(phi_k, phi_l)` to predict how every contact responds to perturbing each residue's contacts (`R = -chi M`, `M` the residue incidence matrix) and ranks residues by their projected effect on a target set (default: the top |PC1| contacts), excluding each residue's own contacts. `--generator energy` instead scales each residue's non-bonded parameters in OpenMM (`G_i = dU/ds_i`, one energy evaluation per residue per frame, run on a GPU with `--frame_stride`).
 
-Install `pip install pymbar` (optional) for a faster MBAR solve; a built-in self-consistent solver is used otherwise.
+Install `pip install pymbar` (optional) for a faster MBAR solve; a built-in self-consistent solver is used otherwise. ChACRA runs pymbar on its numpy/scipy solver (`PYMBAR_DISABLE_JAX=1`): with `jax-cuda12-plugin` installed, pymbar's JAX import initialises the CUDA plugin whatever `JAX_PLATFORMS` says and segfaulted `chacra response` on A100 nodes. Set `CHACRA_PYMBAR_JAX=1` to let pymbar use JAX.
 
 ## Notes
 
